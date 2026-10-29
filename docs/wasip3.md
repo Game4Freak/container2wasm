@@ -103,10 +103,53 @@ Rules and limitations of the bridge:
 ## Current limitations
 
 - No Wizer snapshot: WASI 0.3 images boot Linux at every start (the
-  preview 1 images resume a pre-booted snapshot), so startup takes longer.
-- No networking (`--net`) yet. Networking is expected to be provided through
-  WASI 0.3 sockets or a custom bridged interface in the future.
+  preview 1 images resume a pre-booted snapshot), so startup takes longer
+  (a couple of minutes for alpine under Bochs).
+- No networking (`--net`) yet: the virtio-net device is not present in WASI
+  0.3 images (its PCI slot is used by the bridge device). Networking is
+  expected to be provided through WASI 0.3 sockets or a custom bridged
+  interface in the future.
+- Interactive stdin is unreliable: wasi-libc's non-blocking reads of stdin
+  block on WASI 0.3 and report end of file while the host keeps stdin open.
+  Hosts driving the container through exported interfaces should not give
+  the component a stdin (see `examples/wasip3-bridge/host`).
 - Only wasmtime has been tested as a WASI 0.3 host.
+
+## Behaviour of the bridge worth knowing
+
+- A call made by the host to an exported interface before a program in the
+  container has registered for it is held by the bridge daemon until a
+  program serves the interface (the container usually boots while the host
+  already runs). It fails with an error once the container has exited.
+- Calls made by the container to the host are answered in the order the
+  host completes them; several may be in flight.
+- The emulator module keeps its name section, so traps are reported by
+  wasmtime with readable backtraces (`bochs!...`).
+- Host directories (`wasmtime run --dir host::guest`, or a preopen given by
+  the host program) are mounted in the container at the guest path as with
+  the preview 1 images; files and directories can be created, listed,
+  renamed and removed through them. Permission bits are not reported by
+  WASI, so entries show up with mode 0 (the container runs as root and is
+  not affected). File locks are always granted: WASI has none, and the
+  container is the only user of the device.
+
+## Debugging
+
+- `C2W_BRIDGE_DEBUG=1` in the component's environment (`wasmtime run --env`)
+  makes the emulator log every bridge frame and the exit of the VM to
+  stderr; `c2w --debug-image` enables Bochs' own logging and a verbose
+  kernel.
+- The emulator module keeps its name section: traps are reported by
+  wasmtime as `bochs!<function>` backtraces. Do not use
+  `WASMTIME_BACKTRACE_DETAILS=1`: the DWARF of wasi-libc is stale after
+  optimization and mislabels every frame.
+- `WASMTIME_LOG=wasmtime_wasi=trace` prints every WASI call made by the
+  component with its arguments; a guest that is idle shows up as a stream
+  of `monotonic-clock.wait-for` calls (Bochs sleeps to keep emulated time
+  from running ahead of real time), not as a hang.
+- `extras/wasip3/vmcore/test` runs the bridge, the VM core runtime and a
+  fake emulator under wasmtime in about a minute; use it before rebuilding
+  an image for a change in `extras/wasip3/vmcore`.
 
 ## How it works
 
@@ -152,13 +195,19 @@ The build (`Dockerfile`, stages `p3-*` and `bochs-dev-p3`) has three parts:
      the runtime later invokes the callback, which rewinds the stack and
      resumes emulation. The emulator runs on a private shadow stack so that
      the unwound frames survive while wasi-libc recycles the task's stack.
+     `exit()` is wrapped at link time: Bochs ends with `exit(0)` when the
+     guest powers off, and the wrapper unwinds the emulator with the same
+     Asyncify longjmp so that `run` returns the exit code instead of the
+     instance being torn down by `wasi:cli/exit`.
    - `next-request` and `invoke` are stackless async exports that wait on a
      `future<u8>` which the emulator writes when the matching frame arrives
      from the guest; `complete` is a plain synchronous export that queues a
      frame.
    - The pack files (BIOS, bochsrc, boot.iso, rootfs.bin) are embedded with
      `.incbin` and served through `--wrap`ped POSIX file functions
-     (`c2w_pack.c`); wasi-vfs is not used.
+     (`c2w_pack.c`); wasi-vfs is not used. The pack directory itself can be
+     stat'ed (the 9p device that exposes the VM info file to the guest
+     needs that) but not listed.
    `wac plug` composes the bridge (socket) with the emulator (plug).
 
 3. **Guest side** (`cmd/init/bridge.go`). The emulator adds a second

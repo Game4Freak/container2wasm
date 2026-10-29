@@ -1,13 +1,18 @@
 diff --git a/bochs/iodev/devices.cc b/bochs/iodev/devices.cc
-index 3447ec3e3..43f4bf150 100644
+index 3447ec3e3..049ec5fe9 100644
 --- a/bochs/iodev/devices.cc
 +++ b/bochs/iodev/devices.cc
-@@ -364,6 +364,9 @@ void bx_devices_c::init(BX_MEM_C *newmem)
+@@ -363,7 +363,14 @@ void bx_devices_c::init(BX_MEM_C *newmem)
+   PLUG_load_plugin(mapdirVirtio9p, PLUGTYPE_STANDARD);
    PLUG_load_plugin(packVirtio9p, PLUGTYPE_STANDARD);
    PLUG_load_plugin(stdioVirtioConsole, PLUGTYPE_STANDARD);
-   PLUG_load_plugin(socketVirtioNet, PLUGTYPE_STANDARD);
 +#ifdef WASIP3
++  // Networking is not available on WASI 0.3 yet: the bridge console takes
++  // the PCI slot of virtio-net (i440FX has 5 slots and one must stay free
++  // for the EHCI controller carrying the rootfs).
 +  PLUG_load_plugin(bridgeVirtioConsole, PLUGTYPE_STANDARD);
++#else
+   PLUG_load_plugin(socketVirtioNet, PLUGTYPE_STANDARD);
 +#endif
  #endif
    bx_init_plugins();
@@ -124,10 +129,26 @@ index eecb8ecb5..493389bd6 100644
  
  #ifdef __cplusplus
 diff --git a/bochs/wasm.cc b/bochs/wasm.cc
-index 602f4b907..7bf176063 100644
+index 602f4b907..cd85ba870 100644
 --- a/bochs/wasm.cc
 +++ b/bochs/wasm.cc
-@@ -309,11 +309,70 @@ int putchar_info(FSVirtFile *f, int pos, char c)
+@@ -166,7 +166,15 @@ static int console_read_stdin(void *opaque, uint8_t *buf, int len)
+         return 0;
+     if (ret == 0) {
+         /* EOF */
++#ifdef WASIP3
++        // On WASI 0.3 the host usually drives the guest through the bridge
++        // and gives no stdin; wasi-libc also reports EOF for a non-blocking
++        // read of an idle stdin. Stop polling stdin instead of exiting.
++        SIM->get_param_bool(BXPN_WASM_NOSTDIN)->set(1);
++        return 0;
++#else
+         exit(1);
++#endif
+     }
+ 
+     j = 0;
+@@ -309,11 +317,70 @@ int putchar_info(FSVirtFile *f, int pos, char c)
  
  #ifdef WASI
  #include <wasi/libc.h>
@@ -198,7 +219,7 @@ index 602f4b907..7bf176063 100644
  int populate_preopens() {
    for (__wasi_fd_t fd = 3; fd != 0; ++fd) {
      __wasi_prestat_t prestat;
-@@ -333,42 +392,13 @@ int populate_preopens() {
+@@ -333,42 +400,13 @@ int populate_preopens() {
          return -1;
        prefix[prestat.u.dir.pr_name_len] = '\0';
  
@@ -244,7 +265,7 @@ index 602f4b907..7bf176063 100644
        break;
      }
      default:
-@@ -378,6 +408,7 @@ int populate_preopens() {
+@@ -378,6 +416,7 @@ int populate_preopens() {
  
    return 0;
  }
@@ -252,6 +273,53 @@ index 602f4b907..7bf176063 100644
  
  int is_preopened(const char *path1) {
    for (int j = 0; j < num_preopens; j++) {
+@@ -773,13 +812,17 @@ static int fs_mkdir(FSDevice *fs, FSQID *qid, FSFile *f,
+ static int fs_open(FSDevice *fs, FSQID *qid, FSFile *f, uint32_t flags, void *opaque)
+ {
+     struct stat st;
++    bool have_stat;
+     fs_close(fs, f);
+ 
+-    if ((stat(f->path, &st) != 0) && !is_infofile(fs, f->path))
++    have_stat = (stat(f->path, &st) == 0);
++    if (!have_stat && !is_infofile(fs, f->path))
+         return -errno_to_p9(errno);
+     stat_to_qid(qid, &st);
+ 
+-    if (flags & P9_O_DIRECTORY) {
++    // Directories may be opened without O_DIRECTORY (Go's os.Open does):
++    // they must still be served by fs_readdir rather than fs_read.
++    if ((flags & P9_O_DIRECTORY) || (have_stat && S_ISDIR(st.st_mode))) {
+         DIR *dirp;
+         dirp = opendir(f->path);
+         if (!dirp)
+@@ -1179,7 +1222,12 @@ static int fs_unlinkat(FSDevice *fs, FSFile *f, const char *name)
+ 
+ static int fs_lock(FSDevice *fs, FSFile *f, const FSLock *lock)
+ {
+-    return P9_ENOTSUP; // TODO
++    // WASI has no file locks and the guest is the only client of this
++    // device: every lock is granted (programs such as terraform refuse to
++    // work on a filesystem without locks).
++    if (!f->is_opened)
++        return -P9_EPROTO;
++    return P9_LOCK_SUCCESS;
+ //    int ret;
+ //    struct flock fl;
+ //    
+@@ -1205,7 +1253,11 @@ static int fs_lock(FSDevice *fs, FSFile *f, const FSLock *lock)
+ 
+ static int fs_getlock(FSDevice *fs, FSFile *f, FSLock *lock)
+ {
+-    return P9_ENOTSUP; // TODO
++    // See fs_lock: no lock ever conflicts.
++    if (!f->is_opened)
++        return -P9_EPROTO;
++    lock->type = P9_LOCK_TYPE_UNLCK;
++    return 0;
+ //    int ret;
+ //    struct flock fl;
+ //    
 diff --git a/bochs/wasm.h b/bochs/wasm.h
 index 1952f42da..5f3da07d8 100644
 --- a/bochs/wasm.h

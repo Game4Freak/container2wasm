@@ -14,11 +14,26 @@
 extern uint32_t __wasm_get_stack_pointer(void);
 extern void __wasm_set_stack_pointer(uint32_t);
 int wasm_setjmp_internal(jmp_buf *buf);
+void __real_wasm_longjmp(jmp_buf *buf, int value);
+
+/* Set whenever setjmp or longjmp starts an Asyncify unwind, consumed by
+ * the `run` task driver (c2w_vmcore.c) to tell an unwind from a normal
+ * return of the emulator. jmp.c keeps the last setjmp buffer active, so
+ * handle_jmp() alone cannot tell the two apart. */
+int c2w_jmp_unwind_pending;
 
 __attribute__((noinline, export_name("wasm_setjmp")))
 int wasm_setjmp(jmp_buf *buf) {
   uint32_t sp = __wasm_get_stack_pointer(); /* kept in a wasm local, saved by Asyncify */
+  if (buf->state == 0)
+    c2w_jmp_unwind_pending = 1; /* a fresh setjmp unwinds once */
   int ret = wasm_setjmp_internal(buf);
   __wasm_set_stack_pointer(sp);
   return ret;
+}
+
+/* wasm_longjmp is wrapped at link time (--wrap=wasm_longjmp). */
+void __wrap_wasm_longjmp(jmp_buf *buf, int value) {
+  c2w_jmp_unwind_pending = 1;
+  __real_wasm_longjmp(buf, value);
 }

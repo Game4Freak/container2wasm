@@ -44,7 +44,9 @@ async fn main() -> Result<()> {
     host.func_wrap("add", |_store, (a, b): (u32, u32)| Ok((a + b,)))?;
 
     let mut wasi = WasiCtxBuilder::new();
-    wasi.inherit_stdio().arg("out.wasm").args(&guest_args);
+    // No stdin: the guest is driven through the exported interface, and an
+    // open stdin stalls the emulated console on WASI 0.3 (see docs/wasip3.md).
+    wasi.inherit_stdout().inherit_stderr().arg("out.wasm").args(&guest_args);
     let mut store = Store::new(&engine, State { ctx: wasi.build(), table: ResourceTable::new() });
     let instance = linker.instantiate_async(&mut store, &component).await?;
 

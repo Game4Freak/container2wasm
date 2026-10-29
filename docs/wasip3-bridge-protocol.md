@@ -90,9 +90,12 @@ connection. The program answers with a response carrying the same `id`:
 {"id": 7, "result": "PING"}
 ```
 
-An `error` response (or no handler) is reported to the host: if the function
-returns `result<_, string>` the host receives the error as `err`, otherwise
-the component traps with the message.
+An `error` response is reported to the host: if the function returns
+`result<_, string>` the host receives the error as `err`, otherwise the
+component traps with the message. When no connection serves the interface,
+the bridge keeps the request until one registers for it, so hosts may call
+exported functions as soon as the component is instantiated. Requests still
+pending when the container exits fail with an error.
 
 Requests sent by the two sides are distinguished by the presence of
 `method`; ids chosen by the bridge never need to be unique with the ids chosen
@@ -116,7 +119,7 @@ offset  size  field
 
 | type | name | direction | payload |
 | --- | --- | --- | --- |
-| 1 | HELLO | guest → emulator | empty; sent once when the daemon starts |
+| 1 | HELLO | guest → emulator | empty; sent once when the daemon starts. The emulator sends nothing before it (the port is a plain tty until the daemon configures it) and answers with DESCRIBE before any frame queued earlier |
 | 2 | DESCRIBE | emulator → guest | the world description JSON |
 | 3 | CALL | guest → emulator | `{"interface", "function", "args"}`; `id` chosen by the guest |
 | 4 | RESULT | emulator → guest | `{"result": value}` or `{"error": message}` for the CALL with the same `id` |

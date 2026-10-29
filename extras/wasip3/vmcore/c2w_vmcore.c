@@ -31,6 +31,9 @@
 
 #define NOINLINE __attribute__((noinline))
 
+/* Defined in c2w_jmp_p3.c: set when setjmp/longjmp started an unwind. */
+extern int c2w_jmp_unwind_pending;
+
 /* Defined in jmp.c (not declared by jmp.h). */
 void async_buf_init(struct async_buf *buf);
 void async_buf_note_unwound(struct async_buf *buf);
@@ -80,10 +83,17 @@ typedef struct tx_frame {
 
 static tx_frame_t *tx_head, *tx_tail;
 
-static void tx_push(uint8_t type, uint32_t id, const uint8_t *payload, size_t len) {
+/* Nothing is sent to the guest before its bridge daemon said HELLO: until
+ * then the port is an ordinary tty in the guest (cooked mode with echo),
+ * which would mangle the frames and echo them back. Frames queued earlier
+ * (the host may call exported functions as soon as the component is
+ * instantiated) are delivered after the DESCRIBE answering HELLO. */
+static bool guest_ready;
+
+static tx_frame_t *tx_frame_new(uint8_t type, uint32_t id, const uint8_t *payload, size_t len) {
   if (len > C2W_FRAME_MAX_PAYLOAD) {
     fprintf(stderr, "[c2w-vmcore] dropping oversized frame (%zu bytes)\n", len);
-    return;
+    return NULL;
   }
   tx_frame_t *f = xmalloc(sizeof(*f) + C2W_FRAME_HEADER_SIZE + len);
   f->next = NULL;
@@ -93,18 +103,38 @@ static void tx_push(uint8_t type, uint32_t id, const uint8_t *payload, size_t le
   memcpy(f->data, &h, sizeof(h));
   if (len > 0)
     memcpy(f->data + C2W_FRAME_HEADER_SIZE, payload, len);
+  LOG("tx frame type=%u id=%u len=%zu", type, id, len);
+  return f;
+}
+
+static void tx_push(uint8_t type, uint32_t id, const uint8_t *payload, size_t len) {
+  tx_frame_t *f = tx_frame_new(type, id, payload, len);
+  if (f == NULL)
+    return;
   if (tx_tail == NULL)
     tx_head = f;
   else
     tx_tail->next = f;
   tx_tail = f;
-  LOG("tx frame type=%u id=%u len=%zu", type, id, len);
 }
 
-bool c2w_bridge_tx_pending(void) { return tx_head != NULL; }
+/* Queue a frame ahead of the others (used for DESCRIBE). */
+static void tx_push_front(uint8_t type, uint32_t id, const uint8_t *payload, size_t len) {
+  tx_frame_t *f = tx_frame_new(type, id, payload, len);
+  if (f == NULL)
+    return;
+  f->next = tx_head;
+  tx_head = f;
+  if (tx_tail == NULL)
+    tx_tail = f;
+}
+
+bool c2w_bridge_tx_pending(void) { return guest_ready && tx_head != NULL; }
 
 size_t c2w_bridge_tx_pull(uint8_t *buf, size_t len) {
   size_t copied = 0;
+  if (!guest_ready)
+    return 0;
   while (tx_head != NULL && copied < len) {
     tx_frame_t *f = tx_head;
     size_t n = f->len - f->pos;
@@ -310,8 +340,9 @@ static void handle_frame(const c2w_frame_header_t *h, const uint8_t *payload) {
   switch (h->type) {
   case C2W_FRAME_HELLO:
     LOG("hello from guest");
-    tx_push(C2W_FRAME_DESCRIBE, 0, c2w_bridge_description_start,
-            (size_t)(c2w_bridge_description_end - c2w_bridge_description_start));
+    tx_push_front(C2W_FRAME_DESCRIBE, 0, c2w_bridge_description_start,
+                  (size_t)(c2w_bridge_description_end - c2w_bridge_description_start));
+    guest_ready = true;
     break;
   case C2W_FRAME_CALL:
     handle_call(h->id, payload, h->len);
@@ -365,6 +396,8 @@ void c2w_bridge_rx(const uint8_t *buf, size_t len) {
 /* Exports: next-request / complete / invoke / wake-future                */
 /* ====================================================================== */
 
+static bool vm_finished; /* set once the emulator returned (see run below) */
+
 vm_core_callback_code_t exports_c2w_bridge_vm_next_request(void) {
   pending_request_t *p = pending_head;
   if (p != NULL) {
@@ -391,7 +424,30 @@ void exports_c2w_bridge_vm_complete(uint32_t id, vm_core_string_t *response) {
   vm_core_string_free(response);
 }
 
+static const char vm_exited_error[] = "{\"error\":\"the container has exited\"}";
+
+/* The guest can no longer answer: fail every pending invoke. Called once
+ * when the emulator returns from its main loop. */
+static void fail_invoke_waiters(void) {
+  for (waiter_t *w = invoke_waiters; w != NULL; w = w->next) {
+    if (w->woken)
+      continue;
+    size_t len = sizeof(vm_exited_error) - 1;
+    uint8_t *doc = xmalloc(len);
+    memcpy(doc, vm_exited_error, len);
+    LOG("vm exited -> failing invoke id=%u", w->id);
+    waiter_wake(w, doc, len);
+  }
+}
+
 vm_core_callback_code_t exports_c2w_bridge_vm_invoke(vm_core_string_t *request) {
+  if (vm_finished) {
+    vm_core_string_free(request);
+    vm_core_string_t s;
+    vm_core_string_dup(&s, vm_exited_error);
+    exports_c2w_bridge_vm_invoke_return(s);
+    return VM_CORE_CALLBACK_CODE_EXIT;
+  }
   uint32_t id = ++invoke_seq;
   if (id == 0)
     id = ++invoke_seq;
@@ -441,8 +497,39 @@ static struct async_buf yield_buf;
 static int yield_state;
 static uint32_t parked_sp; /* shadow stack pointer at the last unwind */
 static bool vm_started;
-static bool vm_finished;
 static int vm_exit_code;
+
+/* exit() called by the emulator (for example when the guest powers off)
+ * must not terminate the component instance (wasi:cli/exit would make the
+ * host see an error instead of the result of `run`). The call is wrapped
+ * at link time (--wrap=exit) and unwinds the emulator stack with the
+ * Asyncify based longjmp of jmp.c back to vm_entry_guard, which returns the
+ * exit code. */
+static jmp_buf exit_jmp;
+static int exit_jmp_armed;
+
+NOINLINE static int vm_entry_guard(void) {
+  int r = wasm_setjmp(&exit_jmp);
+  if (r != 0)
+    return r - 1; /* exit(r - 1) was called */
+  exit_jmp_armed = 1;
+  r = c2w_vm_entry();
+  exit_jmp_armed = 0;
+  return r;
+}
+
+void __real_exit(int code);
+
+void __wrap_exit(int code) {
+  fflush(stdout);
+  fflush(stderr);
+  if (exit_jmp_armed) {
+    LOG("exit(%d) called by the emulator", code);
+    wasm_longjmp(&exit_jmp, code + 1);
+    return; /* reached while Asyncify unwinds the stack */
+  }
+  __real_exit(code);
+}
 
 /* Mirrors wasm_setjmp_internal in jmp.c: the function that starts an unwind
  * is re-invoked by Asyncify when the stack is rewound, at which point it
@@ -466,8 +553,15 @@ NOINLINE static vm_core_callback_code_t vm_drive(bool resume_yield) {
     asyncify_start_rewind(&yield_buf);
   }
   for (;;) {
-    vm_exit_code = c2w_vm_entry();
+    vm_exit_code = vm_entry_guard();
     uint32_t sp = __wasm_get_stack_pointer();
+    if (yield_state != 1 && !c2w_jmp_unwind_pending) {
+      /* The emulator returned normally (no unwind in progress). jmp.c keeps
+       * the last setjmp buffer active, so handle_jmp must not be consulted
+       * here. */
+      break;
+    }
+    c2w_jmp_unwind_pending = 0;
     asyncify_stop_unwind();
     if (yield_state == 1) {
       /* c2w_vm_yield unwound the whole emulator stack to this point. */
@@ -486,6 +580,7 @@ NOINLINE static vm_core_callback_code_t vm_drive(bool resume_yield) {
   }
   vm_finished = true;
   LOG("vm exited with code %d", vm_exit_code);
+  fail_invoke_waiters();
   exports_c2w_bridge_vm_result_void_void_t r = {vm_exit_code != 0};
   exports_c2w_bridge_vm_run_return(r);
   return VM_CORE_CALLBACK_CODE_EXIT;

@@ -145,6 +145,12 @@ int c2w_vm_entry(void) {
     if (results_seen >= 4 && invokes_seen >= 2) {
       printf("fakevm: done after %ld iterations\n", i);
       fflush(stdout);
+      if (getenv("FAKEVM_EXIT") != NULL) {
+        /* Like Bochs at guest power-off: exit() must end `run` cleanly. */
+        printf("fakevm: calling exit(0)\n");
+        fflush(stdout);
+        exit(0);
+      }
       return 0;
     }
     c2w_vm_yield();

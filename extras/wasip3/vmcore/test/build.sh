@@ -65,7 +65,7 @@ $CC $CFLAGS -c fakevm.c -o "$VM/fakevm.o"
 $CC $CFLAGS -c "$VM/gen/vm_core.c" -o "$VM/vm_core.o"
 $CC $CFLAGS -c "$JMP_SRC/jmp.c" -o "$VM/jmp.o"
 $CC -mexec-model=reactor -fuse-ld=lld \
-  -Wl,--wrap=open,--wrap=__wasilibc_open_nomode,--wrap=read,--wrap=readv,--wrap=pread,--wrap=lseek,--wrap=close,--wrap=fstat,--wrap=stat,--wrap=access \
+  -Wl,--wrap=open,--wrap=__wasilibc_open_nomode,--wrap=read,--wrap=readv,--wrap=pread,--wrap=lseek,--wrap=close,--wrap=fstat,--wrap=stat,--wrap=lstat,--wrap=access,--wrap=exit,--wrap=wasm_longjmp \
   -Wl,--export=wasm_setjmp,--export=wasm_longjmp,--export=handle_jmp,--export=wasm_setjmp_internal \
   -o "$VM/fakevm.core.wasm" "$VM"/*.o "$VM/gen/vm_core_component_type.o"
 "$BINARYEN_PATH/wasm-opt" "$VM/fakevm.core.wasm" --asyncify -O2 --pass-arg=asyncify-ignore-imports -o "$VM/fakevm.async.wasm"

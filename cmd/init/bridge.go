@@ -64,16 +64,18 @@ type bridgeServer struct {
 	callsMu    sync.Mutex
 	calls      map[uint32]chan *frame // CALL id -> RESULT
 
-	handlersMu sync.Mutex
-	handlers   map[string]*bridgeClient // interface name -> serving client
+	handlersMu   sync.Mutex
+	handlers     map[string]*bridgeClient // interface name -> serving client
+	handlerReady chan struct{}            // closed (and replaced) when a handler registers
 }
 
 func newBridgeServer(port *os.File) *bridgeServer {
 	return &bridgeServer{
 		port:      port,
 		descReady: make(chan struct{}),
-		calls:     make(map[uint32]chan *frame),
-		handlers:  make(map[string]*bridgeClient),
+		calls:        make(map[uint32]chan *frame),
+		handlers:     make(map[string]*bridgeClient),
+		handlerReady: make(chan struct{}),
 	}
 }
 
@@ -133,6 +135,11 @@ func setRawTTY(f *os.File) error {
 	t.Cc[syscall.VMIN] = 1
 	t.Cc[syscall.VTIME] = 0
 	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&t))); e != 0 {
+		return e
+	}
+	// Discard whatever the line discipline queued before raw mode was set.
+	const tcflsh, tcioflush = 0x540B, 2 // <asm-generic/ioctls.h>, <asm-generic/termbits.h>
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), tcflsh, tcioflush); e != 0 {
 		return e
 	}
 	return nil
@@ -248,23 +255,45 @@ func parseResponse(payload []byte) (json.RawMessage, error) {
 
 // handleInvoke routes a call from the host to the client serving the
 // interface and sends its answer back.
+//
+// The host may call an exported interface before the program serving it
+// has started (the container boots while the host already runs): calls
+// made to an interface nobody serves yet are held until a client registers
+// for it. They stay pending if that never happens; the host notices the
+// container's exit through wasi:cli/run.
 func (s *bridgeServer) handleInvoke(f *frame) {
 	var req struct {
 		Interface string `json:"interface"`
+		Function  string `json:"function"`
 	}
-	resp := []byte(`{"error":"no handler registered in the container"}`)
+	var resp []byte
 	if err := json.Unmarshal(f.payload, &req); err != nil {
 		resp = jsonError(fmt.Sprintf("invalid invoke request: %v", err))
 	} else {
-		s.handlersMu.Lock()
-		c := s.handlers[req.Interface]
-		s.handlersMu.Unlock()
-		if c != nil {
-			resp = c.invoke(f.payload)
-		}
+		resp = s.waitHandler(req.Interface, req.Function).invoke(f.payload)
 	}
 	if err := s.writeFrame(frameReturn, f.id, resp); err != nil {
 		log.Printf("bridge: %v", err)
+	}
+}
+
+// waitHandler returns the client serving iface, waiting for one to register
+// if necessary.
+func (s *bridgeServer) waitHandler(iface, function string) *bridgeClient {
+	logged := false
+	for {
+		s.handlersMu.Lock()
+		c := s.handlers[iface]
+		ready := s.handlerReady
+		s.handlersMu.Unlock()
+		if c != nil {
+			return c
+		}
+		if !logged {
+			log.Printf("bridge: %s.%s called by the host; waiting for a program to serve %s", iface, function, iface)
+			logged = true
+		}
+		<-ready
 	}
 }
 
@@ -372,7 +401,10 @@ func (c *bridgeClient) handleRequest(m *rpcMessage) {
 		} else {
 			c.s.handlersMu.Lock()
 			c.s.handlers[p.Interface] = c
+			close(c.s.handlerReady)
+			c.s.handlerReady = make(chan struct{})
 			c.s.handlersMu.Unlock()
+			log.Printf("bridge: %s served by a program in the container", p.Interface)
 			reply.Result = json.RawMessage("true")
 		}
 	default:

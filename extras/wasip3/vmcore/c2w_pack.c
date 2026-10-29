@@ -5,8 +5,10 @@
  * directory (BIOS images, bochsrc, boot.iso, rootfs.bin) are embedded with
  * `.incbin` and served to the emulator through wrappers of the POSIX file
  * functions it uses (`open`, `read`, ... installed with wasm-ld's --wrap).
- * Paths under /pack/ resolve to the embedded data; everything else is
- * forwarded to wasi-libc.
+ * Paths under the pack directory ("/pack/<file>" as used by bochsrc, or the
+ * relative "pack/<file>" used by the 9p device that serves the directory to
+ * the guest) resolve to the embedded data; everything else is forwarded to
+ * wasi-libc. The directory itself can be stat'ed but not listed.
  *
  * The list of files is provided by the generated header c2w_pack_list.h:
  *   C2W_PACK_FILE(identifier, "name", "/absolute/path/at/build/time")
@@ -73,7 +75,7 @@ static const pack_file_t pack_files[] = {
 };
 #define NUM_PACK_FILES (sizeof(pack_files) / sizeof(pack_files[0]))
 
-#define PACK_PREFIX "/pack/"
+#define PACK_DIR "pack"
 #define PACK_FD_BASE 0x40000
 #define PACK_MAX_OPEN 64
 
@@ -84,10 +86,42 @@ typedef struct {
 
 static pack_fd_t pack_fds[PACK_MAX_OPEN];
 
+/* Returns the path relative to the pack directory ("" for the directory
+ * itself) or NULL when `path` is not inside it. The emulator refers to the
+ * pack both as "/pack/<file>" (bochsrc) and as the relative "pack",
+ * "pack/<file>" (the 9p device serving it to the guest). */
+static const char *pack_relative(const char *path) {
+  /* Skip leading "/" and "./" like wasi-libc's path resolution. */
+  for (;;) {
+    if (path[0] == '/')
+      path++;
+    else if (path[0] == '.' && path[1] == '/')
+      path += 2;
+    else if (path[0] == '.' && path[1] == '\0')
+      path++;
+    else
+      break;
+  }
+  size_t n = strlen(PACK_DIR);
+  if (strncmp(path, PACK_DIR, n) != 0)
+    return NULL;
+  path += n;
+  if (*path == '\0')
+    return path;
+  if (*path != '/')
+    return NULL;
+  while (*path == '/')
+    path++;
+  return path;
+}
+
+static bool is_pack_path(const char *path) { return pack_relative(path) != NULL; }
+
+/* Index of the pack file at `path`, -1 if it does not exist. */
 static int pack_lookup(const char *path) {
-  if (strncmp(path, PACK_PREFIX, strlen(PACK_PREFIX)) != 0)
+  const char *name = pack_relative(path);
+  if (name == NULL || *name == '\0')
     return -1;
-  const char *name = path + strlen(PACK_PREFIX);
   for (size_t i = 0; i < NUM_PACK_FILES; i++) {
     if (strcmp(pack_files[i].name, name) == 0)
       return (int)i;
@@ -95,8 +129,9 @@ static int pack_lookup(const char *path) {
   return -1;
 }
 
-static bool is_pack_path(const char *path) {
-  return strncmp(path, PACK_PREFIX, strlen(PACK_PREFIX)) == 0;
+static bool is_pack_dir(const char *path) {
+  const char *name = pack_relative(path);
+  return name != NULL && *name == '\0';
 }
 
 static pack_fd_t *pack_fd(int fd) {
@@ -117,6 +152,15 @@ static void pack_stat(const pack_file_t *f, struct stat *st) {
   st->st_blocks = (st->st_size + 511) / 512;
 }
 
+static void pack_dir_stat(struct stat *st) {
+  memset(st, 0, sizeof(*st));
+  st->st_mode = S_IFDIR | 0555;
+  st->st_size = 4096;
+  st->st_nlink = 2;
+  st->st_blksize = 4096;
+  st->st_blocks = 8;
+}
+
 /* ---- wrappers ---------------------------------------------------------- */
 
 int __real_open(const char *path, int flags, ...);
@@ -128,9 +172,16 @@ off_t __real_lseek(int fd, off_t off, int whence);
 int __real_close(int fd);
 int __real_fstat(int fd, struct stat *st);
 int __real_stat(const char *path, struct stat *st);
+int __real_lstat(const char *path, struct stat *st);
 int __real_access(const char *path, int mode);
 
 static int pack_open(const char *path, int flags) {
+  if (is_pack_dir(path)) {
+    /* Directory listing is not supported (readdir would need libc's
+     * descriptor table); the files are reachable by name. */
+    errno = EISDIR;
+    return -1;
+  }
   int idx = pack_lookup(path);
   if (idx < 0) {
     errno = ENOENT;
@@ -269,9 +320,11 @@ int __wrap_fstat(int fd, struct stat *st) {
   return 0;
 }
 
-int __wrap_stat(const char *path, struct stat *st) {
-  if (!is_pack_path(path))
-    return __real_stat(path, st);
+static int pack_path_stat(const char *path, struct stat *st) {
+  if (is_pack_dir(path)) {
+    pack_dir_stat(st);
+    return 0;
+  }
   int idx = pack_lookup(path);
   if (idx < 0) {
     errno = ENOENT;
@@ -281,10 +334,23 @@ int __wrap_stat(const char *path, struct stat *st) {
   return 0;
 }
 
+int __wrap_stat(const char *path, struct stat *st) {
+  if (!is_pack_path(path))
+    return __real_stat(path, st);
+  return pack_path_stat(path, st);
+}
+
+/* The pack has no symlinks: lstat behaves like stat. */
+int __wrap_lstat(const char *path, struct stat *st) {
+  if (!is_pack_path(path))
+    return __real_lstat(path, st);
+  return pack_path_stat(path, st);
+}
+
 int __wrap_access(const char *path, int mode) {
   if (!is_pack_path(path))
     return __real_access(path, mode);
-  if (pack_lookup(path) < 0) {
+  if (!is_pack_dir(path) && pack_lookup(path) < 0) {
     errno = ENOENT;
     return -1;
   }

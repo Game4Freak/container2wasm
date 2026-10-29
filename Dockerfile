@@ -1081,8 +1081,12 @@ RUN curl -fSL -o /usr/local/bin/wac https://github.com/bytecodealliance/wac/rele
 ENV WASI_SDK_PATH=/opt/wasi-sdk
 ENV BINARYEN_PATH=/opt/binaryen/bin
 
+# Only the parts of the repository needed by the stages below are copied so
+# that unrelated changes (for example to cmd/init) do not invalidate the
+# long Bochs compilation.
 FROM golang-base AS p3-bridge-gen-dev
-COPY --link --from=assets / /work
+COPY --link --from=assets go.mod go.sum /work/
+COPY --link --from=assets cmd/wit-bridge-gen /work/cmd/wit-bridge-gen
 WORKDIR /work
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
@@ -1094,7 +1098,7 @@ FROM ${RUST_P3_IMAGE} AS p3-bridge-dev
 RUN rustup target add wasm32-unknown-unknown
 COPY --link --from=p3-toolchain /usr/local/bin/wasm-tools /usr/local/bin/wasm-tools
 COPY --link --from=p3-bridge-gen-dev /out/wit-bridge-gen /usr/local/bin/wit-bridge-gen
-COPY --link --from=assets / /work
+COPY --link --from=assets extras/wasip3 /work/extras/wasip3
 COPY --link --from=wit-src / /wit
 ARG BRIDGE_WIT_WORLD
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -1102,16 +1106,23 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     CARGO_TARGET_DIR=/cargo-target WIT_BRIDGE_GEN=/usr/local/bin/wit-bridge-gen WIT_WORLD="${BRIDGE_WIT_WORLD}" C2W_SRC=/work \
     /work/extras/wasip3/scripts/build-bridge.sh /wit /out
 
-# Bochs compiled for wasm32-wasip3 with the embedded pack, composed with the bridge.
-FROM p3-toolchain AS bochs-dev-p3
+# Bochs compiled for wasm32-wasip3. This stage does not depend on the
+# container image or the WIT package, so it is cached across conversions.
+FROM p3-toolchain AS bochs-dev-p3-compile
 COPY --link --from=bochs-repo / /Bochs
-COPY --link --from=assets / /work
+COPY --link --from=assets extras/wasip3 /work/extras/wasip3
 RUN cd /Bochs && patch -p1 < /work/extras/wasip3/bochs/bochs-wasip3.patch
+ARG INIT_DEBUG
+RUN BOCHS_SRC=/Bochs OUT=/bochs-out C2W_SRC=/work INIT_DEBUG=${INIT_DEBUG} \
+    /work/extras/wasip3/scripts/build-bochs-p3.sh compile
+
+# The pack (BIOS, kernel, rootfs with the container) and the WIT description
+# are embedded, the module is linked and composed with the bridge.
+FROM bochs-dev-p3-compile AS bochs-dev-p3
 COPY --link --from=vm-amd64-dev /pack /pack
 COPY --link --from=p3-bridge-dev /out/description.json /description.json
-ARG INIT_DEBUG
-RUN BOCHS_SRC=/Bochs PACK_DIR=/pack DESCRIPTION_JSON=/description.json OUT=/bochs-out C2W_SRC=/work INIT_DEBUG=${INIT_DEBUG} \
-    /work/extras/wasip3/scripts/build-bochs-p3.sh
+RUN BOCHS_SRC=/Bochs PACK_DIR=/pack DESCRIPTION_JSON=/description.json OUT=/bochs-out C2W_SRC=/work \
+    /work/extras/wasip3/scripts/build-bochs-p3.sh link
 COPY --link --from=p3-bridge-dev /out/bridge.wasm /bridge.wasm
 ARG OUTPUT_NAME
 RUN mkdir /out && wac plug /bridge.wasm --plug /bochs-out/bochs.wasm -o /out/$OUTPUT_NAME
