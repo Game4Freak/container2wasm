@@ -1,0 +1,25 @@
+package wasi:clocks@0.3.0;
+
+interface types {
+  type duration = u64;
+}
+
+interface monotonic-clock {
+  use types.{duration};
+
+  type mark = u64;
+
+  now: func() -> mark;
+
+  wait-for: async func(how-long: duration);
+}
+
+interface system-clock {
+  record instant {
+    seconds: s64,
+    nanoseconds: u32,
+  }
+
+  now: func() -> instant;
+}
+

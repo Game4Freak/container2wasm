@@ -1,0 +1,12 @@
+[package]
+name = "wasip3-bridge-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wasmtime = { version = "50.0", features = ["component-model", "component-model-async", "async", "cranelift"] }
+wasmtime-wasi = { version = "50.0", features = ["p3"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+futures = "0.3"
+anyhow = "1"

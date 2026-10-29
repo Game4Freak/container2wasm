@@ -1,0 +1,39 @@
+// WIT interface between the emulator core module (Bochs) and the generated
+// bridge component. See docs/wasip3.md for the architecture overview.
+package c2w:bridge@0.1.0;
+
+/// Exported by the emulator core module, imported by the bridge component.
+///
+/// All string payloads are JSON documents described in
+/// docs/wasip3-bridge-protocol.md.
+interface vm {
+    /// Boot the guest and run it until it powers off.
+    ///
+    /// The emulator implements this as a stackless async export that
+    /// regularly yields back to the runtime so that the other functions of
+    /// this interface can make progress while the guest is running.
+    run: async func() -> result;
+
+    /// Wait for the next call request issued by a program running inside the
+    /// guest. The returned JSON document contains the request id and the
+    /// interface, function and arguments of the call.
+    next-request: async func() -> string;
+
+    /// Deliver the response for a request previously returned by
+    /// `next-request`. Never blocks: the response is queued for delivery.
+    complete: func(id: u32, response: string);
+
+    /// Invoke a function exported by a program running inside the guest.
+    /// Resolves once the guest program has produced the response.
+    invoke: async func(request: string) -> string;
+
+    /// Never called. It exists so that the canonical ABI helpers for
+    /// `future<u8>` are available to the emulator, which uses futures to
+    /// wake the tasks waiting in `next-request` and `invoke`.
+    wake-future: func() -> future<u8>;
+}
+
+/// The world implemented by the emulator core module.
+world vm-core {
+    export vm;
+}

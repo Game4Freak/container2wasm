@@ -31,6 +31,9 @@ const (
 )
 
 func main() {
+	if isCallCommand() {
+		os.Exit(runCallCommand(os.Args[1:]))
+	}
 	if err := doInit(); err != nil {
 		panic(err)
 	}
@@ -279,6 +282,14 @@ func doInit() error {
 		return err
 	}
 
+	if info.bridge {
+		// WASI 0.3 images: serve the WIT interfaces of the component to
+		// the container (see docs/wasip3-bridge-protocol.md).
+		if err := startBridge(); err != nil {
+			return fmt.Errorf("failed to start the bridge: %w", err)
+		}
+	}
+
 	s = patchSpec(s, info, imageConfig)
 	log.Printf("Running: %+v\n", s.Process.Args)
 	sd, err := json.Marshal(s)
@@ -417,6 +428,7 @@ type runtimeFlags struct {
 	withNet bool
 	mac     string
 	bundle  string
+	bridge  bool
 }
 
 func parseInfo(infoD []byte) (info runtimeFlags) {
@@ -480,6 +492,8 @@ func parseInfo(infoD []byte) (info runtimeFlags) {
 			}
 		case "b":
 			info.bundle = o
+		case "br":
+			info.bridge = true
 		default:
 			log.Printf("unsupported prefix: %q", inst)
 		}
@@ -489,6 +503,23 @@ func parseInfo(infoD []byte) (info runtimeFlags) {
 
 func patchSpec(s runtimespec.Spec, info runtimeFlags, imageConfig imagespec.Image) runtimespec.Spec {
 	s.Mounts = append(s.Mounts, info.mounts...)
+	if info.bridge {
+		// Expose the bridge socket and the c2w-call client to the container.
+		s.Mounts = append(s.Mounts,
+			runtimespec.Mount{
+				Type:        "bind",
+				Source:      bridgeDir,
+				Destination: bridgeDir,
+				Options:     []string{"rbind", "rw"},
+			},
+			runtimespec.Mount{
+				Type:        "bind",
+				Source:      "/sbin/init",
+				Destination: bridgeCallCmd,
+				Options:     []string{"bind", "ro"},
+			},
+		)
+	}
 	s.Process.Env = append(s.Process.Env, info.env...)
 	entrypoint := info.entrypoint
 	if len(entrypoint) == 0 {

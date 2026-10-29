@@ -47,6 +47,15 @@ func main() {
 			Usage: "target architecture of the source image to use",
 			Value: "amd64",
 		},
+		cli.StringFlag{
+			Name:  "target",
+			Usage: "WASI target of the output: \"wasi-p1\" (default) or \"wasi-p3\" (WASI 0.3 component, experimental)",
+			Value: "wasi-p1",
+		},
+		cli.StringFlag{
+			Name:  "wit",
+			Usage: "directory of the WIT package defining the interfaces bridged into the container (wasi-p3 only)",
+		},
 		cli.StringSliceFlag{
 			Name:  "build-arg",
 			Usage: "Additional build arguments",
@@ -127,6 +136,9 @@ func rootAction(clicontext *cli.Context) error {
 	}
 	if clicontext.Bool("legacy") {
 		legacy = true
+	}
+	if err := validateTarget(clicontext, legacy); err != nil {
+		return err
 	}
 	destDir, destFile := ".", defaultOutputFile
 	if clicontext.Bool("to-js") {
@@ -239,6 +251,19 @@ func build(builderPath string, srcImgPath string, destDir, destFile string, clic
 	if clicontext.Bool("external-bundle") {
 		buildxArgs = append(buildxArgs, "--build-arg", "EXTERNAL_BUNDLE=true")
 	}
+	if clicontext.String("target") == "wasi-p3" {
+		buildxArgs = append(buildxArgs, "--build-arg", "WASI_TARGET=p3")
+		if w := clicontext.String("wit"); w != "" {
+			witDir, err := filepath.Abs(w)
+			if err != nil {
+				return err
+			}
+			buildxArgs = append(buildxArgs,
+				"--build-arg", "BRIDGE_WIT=custom",
+				"--build-context", fmt.Sprintf("wit-custom=%s", witDir),
+			)
+		}
+	}
 	for _, a := range clicontext.StringSlice("build-arg") {
 		buildxArgs = append(buildxArgs, "--build-arg", a)
 	}
@@ -314,6 +339,38 @@ func buildWithLegacyBuilder(builderPath string, srcImgPath, destDir, destFile st
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// validateTarget checks the combination of the --target flag with the
+// other options.
+func validateTarget(clicontext *cli.Context, legacy bool) error {
+	switch clicontext.String("target") {
+	case "wasi-p1":
+		if clicontext.String("wit") != "" {
+			return fmt.Errorf("\"wit\" requires \"--target=wasi-p3\"")
+		}
+		return nil
+	case "wasi-p3":
+		if legacy {
+			return fmt.Errorf("\"--target=wasi-p3\" requires docker buildx")
+		}
+		if clicontext.Bool("to-js") {
+			return fmt.Errorf("\"--target=wasi-p3\" cannot be combined with \"to-js\"")
+		}
+		if a := clicontext.String("target-arch"); a != "amd64" {
+			return fmt.Errorf("\"--target=wasi-p3\" supports only amd64 containers (got %q)", a)
+		}
+		if w := clicontext.String("wit"); w != "" {
+			if st, err := os.Stat(w); err != nil {
+				return fmt.Errorf("invalid wit directory: %w", err)
+			} else if !st.IsDir() {
+				return fmt.Errorf("wit must be a directory containing the WIT package")
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown target %q: must be \"wasi-p1\" or \"wasi-p3\"", clicontext.String("target"))
+	}
 }
 
 func prepareSourceImg(builderPath, imgName, tmpdir, targetarch string) error {

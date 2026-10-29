@@ -1,0 +1,7 @@
+// World used when no WIT directory is passed to `c2w --wit`.
+// The container gets no custom interfaces; only the bridge socket is
+// available (it can still be used to query the description).
+package c2w:default;
+
+world container {
+}

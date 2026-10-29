@@ -28,6 +28,18 @@ ARG JS_OUTPUT_NAME=out # for emscripten; must not include "."
 ARG OPTIMIZATION_MODE=wizer # "wizer" or "native"
 # ARG OPTIMIZATION_MODE=native
 
+# WASI 0.3 (component model) output. See docs/wasip3.md.
+ARG WASI_TARGET=p1 # "p1" (WASI preview 1 module) or "p3" (WASI 0.3 component)
+ARG BRIDGE_WIT=default # "default" or "custom" (--build-context wit-custom=<dir>)
+ARG BRIDGE_WIT_WORLD= # world to bridge when the WIT package defines several
+ARG WASI_SDK_P3_VERSION=34
+ARG WASI_SDK_P3_VERSION_FULL=${WASI_SDK_P3_VERSION}.0
+ARG BINARYEN_P3_VERSION=133
+ARG WASM_TOOLS_VERSION=1.262.0
+ARG WIT_BINDGEN_VERSION=0.63.0
+ARG WAC_VERSION=0.12.0
+ARG RUST_P3_IMAGE=rust:1.99-bookworm
+
 ARG TINYEMU_REPO=https://github.com/ktock/tinyemu-c2w
 ARG TINYEMU_REPO_VERSION=e4e9bd198f9c0505ab4c77a6a9d038059cd1474a
 
@@ -1037,8 +1049,79 @@ RUN /tools/wasi-vfs/wasi-vfs pack /Bochs/bochs/bochs --mapdir /pack::/minpack -o
 ARG OUTPUT_NAME
 RUN mv packed /out/$OUTPUT_NAME
 
+########################################################################
+# WASI 0.3 component (--target=wasi-p3). See docs/wasip3.md.
+########################################################################
+
+# WIT package bridged into the container: the default (empty) world or the
+# directory passed with `c2w --wit` (--build-context wit-custom=<dir>).
+FROM scratch AS wit-default
+COPY --link --from=assets extras/wasip3/wit/default /
+FROM scratch AS wit-custom
+COPY --link --from=assets extras/wasip3/wit/default /
+FROM wit-${BRIDGE_WIT} AS wit-src
+
+FROM ubuntu:22.04 AS p3-toolchain
+ARG WASI_SDK_P3_VERSION
+ARG WASI_SDK_P3_VERSION_FULL
+ARG BINARYEN_P3_VERSION
+ARG WASM_TOOLS_VERSION
+ARG WIT_BINDGEN_VERSION
+ARG WAC_VERSION
+RUN apt-get update && apt-get install -y make curl git xz-utils patch gettext-base
+RUN curl -fSL -o /tmp/wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_P3_VERSION}/wasi-sdk-${WASI_SDK_P3_VERSION_FULL}-x86_64-linux.tar.gz && \
+    mkdir -p /opt && tar -C /opt -xzf /tmp/wasi-sdk.tar.gz && mv /opt/wasi-sdk-${WASI_SDK_P3_VERSION_FULL}-x86_64-linux /opt/wasi-sdk && rm /tmp/wasi-sdk.tar.gz
+RUN curl -fSL -o /tmp/binaryen.tar.gz https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_P3_VERSION}/binaryen-version_${BINARYEN_P3_VERSION}-x86_64-linux.tar.gz && \
+    tar -C /opt -xzf /tmp/binaryen.tar.gz && mv /opt/binaryen-version_${BINARYEN_P3_VERSION} /opt/binaryen && rm /tmp/binaryen.tar.gz
+RUN curl -fSL -o /tmp/wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz && \
+    tar -C /tmp -xzf /tmp/wasm-tools.tar.gz && mv /tmp/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux/wasm-tools /usr/local/bin/ && rm -rf /tmp/wasm-tools*
+RUN curl -fSL -o /tmp/wit-bindgen.tar.gz https://github.com/bytecodealliance/wit-bindgen/releases/download/v${WIT_BINDGEN_VERSION}/wit-bindgen-${WIT_BINDGEN_VERSION}-x86_64-linux.tar.gz && \
+    tar -C /tmp -xzf /tmp/wit-bindgen.tar.gz && mv /tmp/wit-bindgen-${WIT_BINDGEN_VERSION}-x86_64-linux/wit-bindgen /usr/local/bin/ && rm -rf /tmp/wit-bindgen*
+RUN curl -fSL -o /usr/local/bin/wac https://github.com/bytecodealliance/wac/releases/download/v${WAC_VERSION}/wac-cli-x86_64-unknown-linux-musl && chmod 755 /usr/local/bin/wac
+ENV WASI_SDK_PATH=/opt/wasi-sdk
+ENV BINARYEN_PATH=/opt/binaryen/bin
+
+FROM golang-base AS p3-bridge-gen-dev
+COPY --link --from=assets / /work
+WORKDIR /work
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go build -o /out/wit-bridge-gen ./cmd/wit-bridge-gen
+
+# The bridge component: generated from the WIT package, it routes calls
+# between the host and the programs running inside the container.
+FROM ${RUST_P3_IMAGE} AS p3-bridge-dev
+RUN rustup target add wasm32-unknown-unknown
+COPY --link --from=p3-toolchain /usr/local/bin/wasm-tools /usr/local/bin/wasm-tools
+COPY --link --from=p3-bridge-gen-dev /out/wit-bridge-gen /usr/local/bin/wit-bridge-gen
+COPY --link --from=assets / /work
+COPY --link --from=wit-src / /wit
+ARG BRIDGE_WIT_WORLD
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/cargo-target \
+    CARGO_TARGET_DIR=/cargo-target WIT_BRIDGE_GEN=/usr/local/bin/wit-bridge-gen WIT_WORLD="${BRIDGE_WIT_WORLD}" C2W_SRC=/work \
+    /work/extras/wasip3/scripts/build-bridge.sh /wit /out
+
+# Bochs compiled for wasm32-wasip3 with the embedded pack, composed with the bridge.
+FROM p3-toolchain AS bochs-dev-p3
+COPY --link --from=bochs-repo / /Bochs
+COPY --link --from=assets / /work
+RUN cd /Bochs && patch -p1 < /work/extras/wasip3/bochs/bochs-wasip3.patch
+COPY --link --from=vm-amd64-dev /pack /pack
+COPY --link --from=p3-bridge-dev /out/description.json /description.json
+ARG INIT_DEBUG
+RUN BOCHS_SRC=/Bochs PACK_DIR=/pack DESCRIPTION_JSON=/description.json OUT=/bochs-out C2W_SRC=/work INIT_DEBUG=${INIT_DEBUG} \
+    /work/extras/wasip3/scripts/build-bochs-p3.sh
+COPY --link --from=p3-bridge-dev /out/bridge.wasm /bridge.wasm
+ARG OUTPUT_NAME
+RUN mkdir /out && wac plug /bridge.wasm --plug /bochs-out/bochs.wasm -o /out/$OUTPUT_NAME
+
+FROM bochs-dev-packed AS bochs-final-p1
+FROM bochs-dev-p3 AS bochs-final-p3
+FROM bochs-final-${WASI_TARGET} AS bochs-final
+
 FROM scratch AS wasi-amd64
-COPY --link --from=bochs-dev-packed /out/ /
+COPY --link --from=bochs-final /out/ /
 
 
 FROM emscripten/emsdk:$EMSDK_VERSION AS bochs-emscripten

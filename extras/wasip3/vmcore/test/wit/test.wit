@@ -1,0 +1,21 @@
+// World used by the fake VM test (extras/wasip3/vmcore/test).
+package c2w:test@0.1.0;
+
+/// Provided by the host, called from inside the guest.
+interface host {
+    record point { x: s32, y: s32 }
+    add: func(a: u32, b: u32) -> u32;
+    greet: async func(name: string) -> string;
+    swap: func(p: point) -> point;
+}
+
+/// Provided by the guest, called by the host.
+interface guest {
+    echo: async func(msg: string) -> string;
+    sum-list: async func(xs: list<u32>) -> u32;
+}
+
+world test {
+    import host;
+    export guest;
+}

@@ -1,0 +1,15 @@
+# Host program for the fake VM test: runs the composed component with
+# wasmtime, provides the `c2w:test/host` imports and calls the
+# `c2w:test/guest` exports while the VM is running.
+[package]
+name = "c2w-vmcore-testhost"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wasmtime = { version = "50.0", features = ["component-model", "component-model-async", "async", "cranelift"] }
+wasmtime-wasi = { version = "50.0", features = ["p3"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+futures = "0.3"
+anyhow = "1"

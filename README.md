@@ -55,6 +55,18 @@ hi
 
 > Please refer to [`./examples/networking/wasi/`](./examples/networking/wasi/) for enabling networking
 
+### Container Image to WASI 0.3 component (experimental)
+
+`--target=wasi-p3` converts the container to a [WASI 0.3](https://wasi.dev/releases/wasi-p3) component.
+Custom WIT interfaces passed with `--wit` are bridged into the container: programs running in the container can call the functions imported by the component and serve the functions it exports, from any language, through a unix socket.
+
+```console
+$ c2w --target=wasi-p3 --wit ./wit alpine:3.20 out.wasm
+$ wasmtime run -Sp3 out.wasm /run/c2w/c2w-call wasi:clocks/system-clock@0.3.0 now
+```
+
+> Please refer to [`./docs/wasip3.md`](./docs/wasip3.md) and [`./examples/wasip3-bridge/`](./examples/wasip3-bridge/) for details.
+
 ### Container on Browser
 
 ![Container on browser](./docs/images/ubuntu-wasi-on-browser.png)
@@ -207,6 +219,8 @@ Options
 - `--dockerfile value`: Custom location of Dockerfile (default: embedded to this command)
 - `--builder value`: Bulider command to use (default: "docker")
 - `--target-arch value`: target architecture of the source image to use (default: "amd64")
+- `--target value`: WASI target of the output: `wasi-p1` (default) or `wasi-p3` (WASI 0.3 component, experimental, see [`./docs/wasip3.md`](./docs/wasip3.md))
+- `--wit value`: directory of the WIT package defining the interfaces bridged into the container (`wasi-p3` only)
 - `--build-arg value`: Additional build arguments (please see Dockerfile for available build args)
 - `--to-js`: convert the container to WASM using emscripten
 - `--debug-image`: Enable debug print in the output image

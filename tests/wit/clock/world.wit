@@ -1,0 +1,7 @@
+// WIT package used by the integration tests: routes the standard WASI
+// system clock into the container through the bridge.
+package c2w:test-clock;
+
+world clock {
+    import wasi:clocks/system-clock@0.3.0;
+}

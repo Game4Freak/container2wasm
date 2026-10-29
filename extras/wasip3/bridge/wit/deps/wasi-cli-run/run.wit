@@ -1,0 +1,8 @@
+// Subset of wasi:cli@0.3.0 needed by the bridge component: the `run`
+// interface exported by command components.
+package wasi:cli@0.3.0;
+
+interface run {
+    /// Run the program.
+    run: async func() -> result;
+}

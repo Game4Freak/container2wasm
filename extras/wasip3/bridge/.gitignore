@@ -1,0 +1,5 @@
+/target/
+/src/generated.rs
+/wit/world.wit
+/wit/deps/app/
+/wit/deps/c2w-bridge/

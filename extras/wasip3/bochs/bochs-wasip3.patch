@@ -1,0 +1,269 @@
+diff --git a/bochs/iodev/devices.cc b/bochs/iodev/devices.cc
+index 3447ec3e3..43f4bf150 100644
+--- a/bochs/iodev/devices.cc
++++ b/bochs/iodev/devices.cc
+@@ -364,6 +364,9 @@ void bx_devices_c::init(BX_MEM_C *newmem)
+   PLUG_load_plugin(packVirtio9p, PLUGTYPE_STANDARD);
+   PLUG_load_plugin(stdioVirtioConsole, PLUGTYPE_STANDARD);
+   PLUG_load_plugin(socketVirtioNet, PLUGTYPE_STANDARD);
++#ifdef WASIP3
++  PLUG_load_plugin(bridgeVirtioConsole, PLUGTYPE_STANDARD);
++#endif
+ #endif
+   bx_init_plugins();
+ 
+diff --git a/bochs/main.cc b/bochs/main.cc
+index 1b269fa0a..2a681d5e9 100644
+--- a/bochs/main.cc
++++ b/bochs/main.cc
+@@ -39,7 +39,9 @@
+ #endif
+ 
+ #ifdef WASI
++#ifndef WASIP3
+ #include <wizer.h>
++#endif
+ #include <wasi/libc-environ.h>
+ extern "C" {
+ #include "jmp.h"
+@@ -593,6 +595,10 @@ int init_vm(int argc, char **argv, FSVirtFile *info)
+ #endif
+ 
+     if (net != NULL) {
++#ifdef WASIP3
++      fprintf(stderr, "networking is not supported on WASI 0.3 images yet\n");
++      exit(1);
++#endif
+       if (!strncmp(net, "socket", 6)) {
+         if (start_socket_net(net) != 0) {
+           fprintf(stderr, "failed to wait socket net");
+@@ -625,6 +631,18 @@ int init_vm(int argc, char **argv, FSVirtFile *info)
+     }
+     pos += ps;
+ 
++#ifdef WASIP3
++    {
++      // The bridge device (/dev/hvc1 in the guest) is always present.
++      int p = write_info(info, pos, 9, "br: hvc1\n");
++      if (p < 0) {
++        printf("failed to prepare bridge info\n");
++        exit(1);
++      }
++      pos += p;
++    }
++#endif
++
+     info->len = pos;
+ #ifdef WASI
+     info->len += write_preopen_info(info, pos);
+@@ -866,7 +884,21 @@ int WINAPI WinMain(
+ #endif
+ 
+ #if !defined(__WXMSW__)
+-#ifdef WASI
++#if defined(WASIP3)
++// On WASI 0.3 the Asyncify unwinds (setjmp/longjmp and cooperative yields)
++// are driven by the `run` task of extras/wasip3/vmcore/c2w_vmcore.c.
++int wasm_start(int (main)()) {
++  return main();
++}
++int CDECL init_func(void)
++{
++  return bxmain();
++}
++int start_vm(void)
++{
++  return bxmain();
++}
++#elif defined(WASI)
+ extern "C" {
+ extern void __wasi_vfs_rt_init(void);
+ }
+@@ -913,7 +945,9 @@ int CDECL main(int argc, char *argv[])
+ {
+ #ifdef WASI
+   __wasilibc_ensure_environ();
++#ifndef WASIP3
+   __wasi_vfs_rt_init();
++#endif
+   if (populate_preopens() != 0) { // register wasi-vfs dir to wasi-libc and our list
+     fprintf(stderr, "failed to populate preopens");
+     return -1;
+diff --git a/bochs/plugin.cc b/bochs/plugin.cc
+index 888aaade9..709abebc8 100644
+--- a/bochs/plugin.cc
++++ b/bochs/plugin.cc
+@@ -1066,6 +1066,9 @@ plugin_t bx_builtin_plugins[] = {
+   BUILTIN_OPTPCI_PLUGIN_ENTRY(packVirtio9p),
+   BUILTIN_OPTPCI_PLUGIN_ENTRY(stdioVirtioConsole),
+   BUILTIN_OPTPCI_PLUGIN_ENTRY(socketVirtioNet),
++#ifdef WASIP3
++  BUILTIN_OPTPCI_PLUGIN_ENTRY(bridgeVirtioConsole),
++#endif
+ #if BX_SUPPORT_SOUNDLOW
+   BUILTIN_SND_PLUGIN_ENTRY(dummy),
+   BUILTIN_SND_PLUGIN_ENTRY(file),
+diff --git a/bochs/plugin.h b/bochs/plugin.h
+index eecb8ecb5..493389bd6 100644
+--- a/bochs/plugin.h
++++ b/bochs/plugin.h
+@@ -80,6 +80,7 @@ extern "C" {
+ #define BX_PLUGIN_PACK_VIRTIO_9P "packVirtio9p"
+ #define BX_PLUGIN_STDIO_VIRTIO_CONSOLE "stdioVirtioConsole"
+ #define BX_PLUGIN_SOCKET_VIRTIO_NET "socketVirtioNet"
++#define BX_PLUGIN_BRIDGE_VIRTIO_CONSOLE "bridgeVirtioConsole"
+ 
+ #define BX_REGISTER_DEVICE_DEVMODEL(a,b,c,d) pluginRegisterDeviceDevmodel(a,b,c,d)
+ #define BX_UNREGISTER_DEVICE_DEVMODEL(a,b) pluginUnregisterDeviceDevmodel(a,b)
+@@ -497,6 +498,7 @@ PLUGIN_ENTRY_FOR_MODULE(mapdirVirtio9p);
+ PLUGIN_ENTRY_FOR_MODULE(packVirtio9p);
+ PLUGIN_ENTRY_FOR_MODULE(stdioVirtioConsole);
+ PLUGIN_ENTRY_FOR_MODULE(socketVirtioNet);
++PLUGIN_ENTRY_FOR_MODULE(bridgeVirtioConsole);
+ #endif
+ 
+ #ifdef __cplusplus
+diff --git a/bochs/wasm.cc b/bochs/wasm.cc
+index 602f4b907..7bf176063 100644
+--- a/bochs/wasm.cc
++++ b/bochs/wasm.cc
+@@ -309,11 +309,70 @@ int putchar_info(FSVirtFile *f, int pos, char c)
+ 
+ #ifdef WASI
+ #include <wasi/libc.h>
++#ifdef WASIP3
++#include <wasi/wasip3.h>
++#endif
+ 
+ preopen *preopens;
+ size_t num_preopens = 0;
+ size_t preopen_capacity = 0;
+ 
++static int preopens_push(const char *p) {
++  if (num_preopens == preopen_capacity) {
++    size_t new_capacity = preopen_capacity == 0 ? 4 : preopen_capacity * 2;
++    preopen *new_preopens = (preopen *)calloc(sizeof(preopen), new_capacity);
++    if (new_preopens == NULL) {
++      return -1;
++    }
++    memcpy(new_preopens, preopens, num_preopens * sizeof(preopen));
++    free(preopens);
++    preopens = new_preopens;
++    preopen_capacity = new_capacity;
++  }
++  char *prefix2 = strdup(p);
++  if (prefix2 == NULL)
++    return -1;
++  preopens[num_preopens++] = (preopen) { prefix2, -1, };
++  return 0;
++}
++
++static const char *strip_prefix(char *prefix) {
++  int off = 0;
++  while (1) {
++    if (prefix[off] == '/') {
++      off++;
++    } else if (prefix[off] == '.' && prefix[off + 1] == '/') {
++      off += 2;
++    } else if (prefix[off] == '.' && prefix[off + 1] == 0) {
++      off++;
++    } else {
++      break;
++    }
++  }
++  return &(prefix[off]);
++}
++
++#ifdef WASIP3
++// On WASI p3, wasi-libc already registers the preopened directories with
++// its own path resolver. We only need their names so that the guest can be
++// told which host directories are mapped (see write_preopen_info).
++int populate_preopens() {
++  filesystem_preopens_list_tuple2_own_descriptor_string_t dirs;
++  filesystem_preopens_get_directories(&dirs);
++  for (size_t i = 0; i < dirs.len; i++) {
++    char *prefix = (char *)malloc(dirs.ptr[i].f1.len + 1);
++    if (prefix == NULL)
++      return -1;
++    memcpy(prefix, dirs.ptr[i].f1.ptr, dirs.ptr[i].f1.len);
++    prefix[dirs.ptr[i].f1.len] = '\0';
++    if (preopens_push(strip_prefix(prefix)) != 0)
++      return -1;
++    free(prefix);
++  }
++  filesystem_preopens_list_tuple2_own_descriptor_string_free(&dirs);
++  return 0;
++}
++#else
+ int populate_preopens() {
+   for (__wasi_fd_t fd = 3; fd != 0; ++fd) {
+     __wasi_prestat_t prestat;
+@@ -333,42 +392,13 @@ int populate_preopens() {
+         return -1;
+       prefix[prestat.u.dir.pr_name_len] = '\0';
+ 
+-      int off = 0;
+-      while (1) {
+-        if (prefix[off] == '/') {
+-          off++;
+-        } else if (prefix[off] == '.' && prefix[off + 1] == '/') {
+-          off += 2;
+-        } else if (prefix[off] == '.' && prefix[off + 1] == 0) {
+-          off++;
+-        } else {
+-          break;
+-        }
+-      }
+-
+-      char *p = &(prefix[off]);
++      const char *p = strip_prefix(prefix);
+       if (__wasilibc_register_preopened_fd(fd, strdup(p)) != 0)
+         return -1;
+-
+-      if (num_preopens == preopen_capacity) {
+-        size_t new_capacity = preopen_capacity == 0 ? 4 : preopen_capacity * 2;
+-        preopen *new_preopens = (preopen *)calloc(sizeof(preopen), new_capacity);
+-        if (new_preopens == NULL) {
+-          return -1;
+-        }
+-        memcpy(new_preopens, preopens, num_preopens * sizeof(preopen));
+-        free(preopens);
+-        preopens = new_preopens;
+-        preopen_capacity = new_capacity;
+-      }
+-
+-      char *prefix2 = strdup(p);
+-      if (prefix2 == NULL)
++      if (preopens_push(p) != 0)
+         return -1;
+-
+-      preopens[num_preopens++] = (preopen) { prefix2, fd, };
++      preopens[num_preopens - 1].fd = fd;
+       free(prefix);
+-
+       break;
+     }
+     default:
+@@ -378,6 +408,7 @@ int populate_preopens() {
+ 
+   return 0;
+ }
++#endif
+ 
+ int is_preopened(const char *path1) {
+   for (int j = 0; j < num_preopens; j++) {
+diff --git a/bochs/wasm.h b/bochs/wasm.h
+index 1952f42da..5f3da07d8 100644
+--- a/bochs/wasm.h
++++ b/bochs/wasm.h
+@@ -65,8 +65,8 @@ typedef struct preopen {
+     /// The path prefix associated with the file descriptor.
+     const char *prefix;
+ 
+-    /// The file descriptor.
+-    __wasi_fd_t fd;
++    /// The file descriptor (unused on WASI p3 where libc owns the descriptors).
++    int fd;
+ } preopen;
+ 
+ int populate_preopens();
