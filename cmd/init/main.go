@@ -211,7 +211,13 @@ func doInit() error {
 		if o, err := exec.Command("ip", "link", "set", "dev", "eth0", "up").CombinedOutput(); err != nil {
 			return fmt.Errorf("failed eth0 up: %v: %w", string(o), err)
 		}
-		if o, err := exec.Command("udhcpc", "-i", "eth0").CombinedOutput(); err != nil {
+		if info.bridge {
+			// WASI 0.3 images: the network stack of the bridge component
+			// is the gateway and the DNS server (see docs/wasip3.md).
+			if err := configureBridgeNetwork(); err != nil {
+				return err
+			}
+		} else if o, err := exec.Command("udhcpc", "-i", "eth0").CombinedOutput(); err != nil {
 			return fmt.Errorf("failed udhcpc: %w", err)
 		} else if cfg.Debug {
 			o2, _ := exec.Command("ip", "a").CombinedOutput()
@@ -418,6 +424,30 @@ var (
 	delimLines = regexp.MustCompile(`[^\\]\n`)
 	delimArgs  = regexp.MustCompile(`[^\\] `)
 )
+
+// Addresses of the network behind the bridge component of WASI 0.3 images
+// (extras/wasip3/bridge/src/netstack.rs).
+const (
+	bridgeNetAddress = "10.0.2.15/24"
+	bridgeNetGateway = "10.0.2.2"
+	bridgeNetDNS     = "10.0.2.3"
+)
+
+func configureBridgeNetwork() error {
+	cmds := [][]string{
+		{"ip", "addr", "add", bridgeNetAddress, "dev", "eth0"},
+		{"ip", "route", "add", "default", "via", bridgeNetGateway, "dev", "eth0"},
+	}
+	for _, c := range cmds {
+		if o, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("failed %v: %v: %w", c, string(o), err)
+		}
+	}
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+bridgeNetDNS+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write resolv.conf: %w", err)
+	}
+	return nil
+}
 
 type runtimeFlags struct {
 	mounts     []runtimespec.Mount

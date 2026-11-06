@@ -9,6 +9,10 @@
 //! * it exports the interfaces of the container's WIT world and forwards
 //!   calls into the guest (`c2w:bridge/vm.invoke`).
 //!
+//! * it runs the network stack behind the guest's virtio-net device
+//!   (`netstack.rs`), which turns the guest's TCP connections and DNS
+//!   queries into `wasi:sockets` calls.
+//!
 //! Everything that depends on the container's WIT world lives in
 //! `generated.rs`, produced by `cmd/wit-bridge-gen`. This file contains the
 //! world independent runtime: the request pump and the JSON helpers used by
@@ -18,6 +22,7 @@
 #![allow(dead_code, unused_imports, clippy::all)]
 
 mod generated;
+mod netstack;
 
 pub mod runtime {
     use crate::generated::c2w::bridge::vm;
@@ -26,6 +31,7 @@ pub mod runtime {
     /// Implementation of `wasi:cli/run`.
     pub async fn run() -> Result<(), ()> {
         wit_bindgen::spawn_local(pump());
+        crate::netstack::start();
         vm::run().await
     }
 

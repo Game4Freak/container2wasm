@@ -47,6 +47,9 @@ async fn main() -> Result<()> {
     // No stdin: the guest is driven through the exported interface, and an
     // open stdin stalls the emulated console on WASI 0.3 (see docs/wasip3.md).
     wasi.inherit_stdout().inherit_stderr().arg("out.wasm").args(&guest_args);
+    // The container reaches the network through wasi:sockets (see
+    // docs/wasip3.md): the host grants access, nothing else.
+    wasi.inherit_network().allow_tcp(true).allow_udp(true).allow_ip_name_lookup(true);
     let mut store = Store::new(&engine, State { ctx: wasi.build(), table: ResourceTable::new() });
     let instance = linker.instantiate_async(&mut store, &component).await?;
 

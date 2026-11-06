@@ -25,7 +25,7 @@ fi
 
 CRATE="$OUT/crate"
 rm -rf "$CRATE"
-mkdir -p "$CRATE/src" "$CRATE/wit/deps/app" "$CRATE/wit/deps/c2w-bridge" "$CRATE/wit/deps/wasi-cli-run"
+mkdir -p "$CRATE/src" "$CRATE/wit/deps/app" "$CRATE/wit/deps/c2w-bridge"
 wasm-tools component wit --json "$WIT_DIR" > "$OUT/resolve.json"
 "$WIT_BRIDGE_GEN" --resolve "$OUT/resolve.json" ${WIT_WORLD:+--world "$WIT_WORLD"} --out "$OUT/gen"
 # The WIT package of the container and its dependencies.
@@ -34,10 +34,10 @@ if [ -d "$WIT_DIR/deps" ]; then
 fi
 cp "$WIT_DIR"/*.wit "$CRATE/wit/deps/app/"
 cp "$C2W_SRC/extras/wasip3/wit/c2w-bridge/"*.wit "$CRATE/wit/deps/c2w-bridge/"
-cp "$C2W_SRC/extras/wasip3/bridge/wit/deps/wasi-cli-run/"*.wit "$CRATE/wit/deps/wasi-cli-run/"
+cp -r "$C2W_SRC/extras/wasip3/bridge/wit/deps/." "$CRATE/wit/deps/"
 cp "$OUT/gen/world.wit" "$CRATE/wit/"
 cp "$C2W_SRC/extras/wasip3/bridge/Cargo.toml" "$C2W_SRC/extras/wasip3/bridge/Cargo.lock" "$CRATE/"
-cp "$C2W_SRC/extras/wasip3/bridge/src/lib.rs" "$OUT/gen/generated.rs" "$CRATE/src/"
+cp "$C2W_SRC/extras/wasip3/bridge/src/"*.rs "$OUT/gen/generated.rs" "$CRATE/src/"
 (cd "$CRATE" && cargo build --release --target wasm32-unknown-unknown --locked)
 TARGET_DIR=${CARGO_TARGET_DIR:-$CRATE/target}
 wasm-tools component new "$TARGET_DIR/wasm32-unknown-unknown/release/c2w_bridge.wasm" -o "$OUT/bridge.wasm"

@@ -258,9 +258,11 @@ static waiter_t *list_find_by_id(waiter_t *head, uint32_t id) {
   return NULL;
 }
 
-/* Handle the callback of a waiting task: return `w`'s payload via `ret`. */
+/* Handle the callback of a waiting task: return `w`'s payload via `ret`
+ * (a `*_return` function taking a string or a list<u8>, which share the
+ * same {ptr, len} layout). */
 static vm_core_callback_code_t waiter_callback(waiter_t **head, vm_core_event_t *event,
-                                               void (*ret)(vm_core_string_t)) {
+                                               void (*ret)(vm_core_list_u8_t)) {
   if (event->event == VM_CORE_EVENT_CANCEL) {
     /* The caller cancelled the task. Drop whatever we were waiting for. */
     /* Cancellation events carry no handle: drop the oldest idle waiter. */
@@ -282,10 +284,20 @@ static vm_core_callback_code_t waiter_callback(waiter_t **head, vm_core_event_t 
     fprintf(stderr, "[c2w-vmcore] event for unknown waitable %u\n", event->waitable);
     abort();
   }
-  vm_core_string_t s = {w->payload, w->payload_len};
+  vm_core_list_u8_t s = {w->payload, w->payload_len};
   ret(s);
   waiter_free(w);
   return VM_CORE_CALLBACK_CODE_EXIT;
+}
+
+static void next_request_return(vm_core_list_u8_t v) {
+  vm_core_string_t s = {v.ptr, v.len};
+  exports_c2w_bridge_vm_next_request_return(s);
+}
+
+static void invoke_return(vm_core_list_u8_t v) {
+  vm_core_string_t s = {v.ptr, v.len};
+  exports_c2w_bridge_vm_invoke_return(s);
 }
 
 /* ====================================================================== */
@@ -416,7 +428,7 @@ vm_core_callback_code_t exports_c2w_bridge_vm_next_request(void) {
 }
 
 vm_core_callback_code_t exports_c2w_bridge_vm_next_request_callback(vm_core_event_t *event) {
-  return waiter_callback(&next_request_waiters, event, exports_c2w_bridge_vm_next_request_return);
+  return waiter_callback(&next_request_waiters, event, next_request_return);
 }
 
 void exports_c2w_bridge_vm_complete(uint32_t id, vm_core_string_t *response) {
@@ -459,7 +471,13 @@ vm_core_callback_code_t exports_c2w_bridge_vm_invoke(vm_core_string_t *request) 
 }
 
 vm_core_callback_code_t exports_c2w_bridge_vm_invoke_callback(vm_core_event_t *event) {
-  return waiter_callback(&invoke_waiters, event, exports_c2w_bridge_vm_invoke_return);
+  return waiter_callback(&invoke_waiters, event, invoke_return);
+}
+
+void exports_c2w_bridge_vm_log(vm_core_string_t *message) {
+  if (c2w_bridge_debug())
+    fprintf(stderr, "[c2w-bridge] %.*s\n", (int)message->len, (const char *)message->ptr);
+  vm_core_string_free(message);
 }
 
 exports_c2w_bridge_vm_future_u8_t exports_c2w_bridge_vm_wake_future(void) {
@@ -467,6 +485,146 @@ exports_c2w_bridge_vm_future_u8_t exports_c2w_bridge_vm_wake_future(void) {
   exports_c2w_bridge_vm_future_u8_t reader = exports_c2w_bridge_vm_future_u8_new(&writer);
   exports_c2w_bridge_vm_future_u8_drop_writable(writer);
   return reader;
+}
+
+/* ====================================================================== */
+/* Network frames (virtio-net device <-> bridge component)                */
+/* ====================================================================== */
+/*
+ * Frames travel in both directions as simple FIFOs. Towards the component
+ * they are delivered through the async `net-recv` export, which batches
+ * every pending frame into one list ([u16 len][frame]...). Towards the
+ * guest, `net-send` splits the batch into frames that the virtio-net
+ * device pulls with c2w_net_tx_pull.
+ */
+
+typedef struct net_frame {
+  struct net_frame *next;
+  size_t len;
+  uint8_t data[];
+} net_frame_t;
+
+typedef struct {
+  net_frame_t *head, *tail;
+  size_t count, bytes;
+} net_queue_t;
+
+static net_queue_t net_rx; /* guest -> component */
+static net_queue_t net_tx; /* component -> guest */
+static waiter_t *net_recv_waiters;
+
+/* Bound on frames held for a slow consumer (each queue). Beyond it frames
+ * are dropped, which TCP recovers from. */
+#define NET_QUEUE_MAX_FRAMES 256
+#define NET_FRAME_MAX 65536
+
+static void net_queue_push(net_queue_t *q, const uint8_t *data, size_t len) {
+  if (len == 0 || len > NET_FRAME_MAX || q->count >= NET_QUEUE_MAX_FRAMES) {
+    LOG("dropping frame of %zu bytes (%zu queued)", len, q->count);
+    return;
+  }
+  net_frame_t *f = xmalloc(sizeof(*f) + len);
+  f->next = NULL;
+  f->len = len;
+  memcpy(f->data, data, len);
+  if (q->tail == NULL)
+    q->head = f;
+  else
+    q->tail->next = f;
+  q->tail = f;
+  q->count++;
+  q->bytes += len;
+}
+
+static net_frame_t *net_queue_pop(net_queue_t *q) {
+  net_frame_t *f = q->head;
+  if (f == NULL)
+    return NULL;
+  q->head = f->next;
+  if (q->head == NULL)
+    q->tail = NULL;
+  q->count--;
+  q->bytes -= f->len;
+  return f;
+}
+
+/* Serialize and drain the rx queue into a freshly allocated batch. */
+static uint8_t *net_rx_batch(size_t *out_len) {
+  size_t total = net_rx.bytes + 2 * net_rx.count;
+  uint8_t *buf = xmalloc(total);
+  size_t off = 0;
+  net_frame_t *f;
+  while ((f = net_queue_pop(&net_rx)) != NULL) {
+    buf[off] = (uint8_t)(f->len & 0xff);
+    buf[off + 1] = (uint8_t)(f->len >> 8);
+    memcpy(buf + off + 2, f->data, f->len);
+    off += 2 + f->len;
+    free(f);
+  }
+  *out_len = off;
+  return buf;
+}
+
+void c2w_net_rx(const uint8_t *frame, size_t len) {
+  net_queue_push(&net_rx, frame, len);
+  waiter_t *w = list_first_idle(net_recv_waiters);
+  if (w != NULL) {
+    size_t blen;
+    uint8_t *batch = net_rx_batch(&blen);
+    waiter_wake(w, batch, blen);
+  }
+}
+
+bool c2w_net_tx_pending(void) { return net_tx.head != NULL; }
+
+size_t c2w_net_tx_pull(uint8_t *buf, size_t cap) {
+  net_frame_t *f = net_queue_pop(&net_tx);
+  if (f == NULL)
+    return 0;
+  size_t n = f->len;
+  if (n > cap) {
+    LOG("dropping frame of %zu bytes: device buffer holds %zu", n, cap);
+    n = 0;
+  } else {
+    memcpy(buf, f->data, n);
+  }
+  free(f);
+  return n;
+}
+
+static void net_recv_return(vm_core_list_u8_t v) { exports_c2w_bridge_vm_net_recv_return(v); }
+
+vm_core_callback_code_t exports_c2w_bridge_vm_net_recv(void) {
+  if (net_rx.head != NULL) {
+    size_t blen;
+    uint8_t *batch = net_rx_batch(&blen);
+    vm_core_list_u8_t l = {batch, blen};
+    exports_c2w_bridge_vm_net_recv_return(l);
+    free(batch);
+    return VM_CORE_CALLBACK_CODE_EXIT;
+  }
+  waiter_t *w = waiter_new(0);
+  list_push(&net_recv_waiters, w);
+  return VM_CORE_CALLBACK_CODE_WAIT(w->set);
+}
+
+vm_core_callback_code_t exports_c2w_bridge_vm_net_recv_callback(vm_core_event_t *event) {
+  return waiter_callback(&net_recv_waiters, event, net_recv_return);
+}
+
+void exports_c2w_bridge_vm_net_send(vm_core_list_u8_t *frames) {
+  size_t off = 0;
+  while (off + 2 <= frames->len) {
+    size_t len = (size_t)frames->ptr[off] | ((size_t)frames->ptr[off + 1] << 8);
+    off += 2;
+    if (len == 0 || off + len > frames->len) {
+      fprintf(stderr, "[c2w-vmcore] malformed frame batch from the bridge\n");
+      break;
+    }
+    net_queue_push(&net_tx, frames->ptr + off, len);
+    off += len;
+  }
+  vm_core_list_u8_free(frames);
 }
 
 /* ====================================================================== */

@@ -71,8 +71,8 @@ type bridgeServer struct {
 
 func newBridgeServer(port *os.File) *bridgeServer {
 	return &bridgeServer{
-		port:      port,
-		descReady: make(chan struct{}),
+		port:         port,
+		descReady:    make(chan struct{}),
 		calls:        make(map[uint32]chan *frame),
 		handlers:     make(map[string]*bridgeClient),
 		handlerReady: make(chan struct{}),

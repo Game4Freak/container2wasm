@@ -100,15 +100,53 @@ Rules and limitations of the bridge:
   wit --json`) is available to programs in the container
   (`c2w-call --describe`), which lets SDKs validate or generate code.
 
+## Networking
+
+WASI 0.3 images always have a network interface, and the host decides what
+it may reach: the component imports `wasi:sockets@0.3.0` (TCP sockets and
+name lookup) and nothing else is needed on the host side.
+
+```console
+$ wasmtime run -Sp3 -Sinherit-network -Sallow-ip-name-lookup out.wasm wget -q -O - https://example.com/
+```
+
+A host written with `wasmtime-wasi` grants the same with
+`WasiCtxBuilder::inherit_network()`, `allow_tcp(true)` and
+`allow_ip_name_lookup(true)` (TCP is disabled by default in the builder);
+`socket_addr_check` restricts the addresses the container may connect to.
+Without the grants, connections fail inside the container (the host sees
+nothing special).
+
+How it works: the guest's virtio-net device is wired to a user-space TCP/IP
+stack ([smoltcp](https://github.com/smoltcp-rs/smoltcp)) running in the
+bridge component (`extras/wasip3/bridge/src/netstack.rs`). The guest lives
+on `10.0.2.0/24` with the static address `10.0.2.15` configured by `init`
+(no DHCP):
+
+| address | role |
+| --- | --- |
+| `10.0.2.15` | the guest |
+| `10.0.2.2` | the stack: default gateway, answers ARP and ping |
+| `10.0.2.3` | DNS server: `A` queries are resolved with `wasi:sockets/ip-name-lookup`, other types get an empty answer |
+
+Every TCP connection the guest opens (to any address) terminates in the
+stack, which connects to the same address and port with a `wasi:sockets`
+TCP socket of the host and copies data in both directions, including
+half-closes. If the host connection fails the guest connection is reset.
+What is not supported yet: UDP other than DNS, inbound connections
+(listening in the guest), IPv6 (the guest has no IPv6 address, and `AAAA`
+queries return no records), and the `--net`/`--mac` runtime flags of the
+preview 1 images. The addresses are constants in `netstack.rs` and
+`cmd/init/main.go`.
+
 ## Current limitations
 
 - No Wizer snapshot: WASI 0.3 images boot Linux at every start (the
   preview 1 images resume a pre-booted snapshot), so startup takes longer
   (a couple of minutes for alpine under Bochs).
-- No networking (`--net`) yet: the virtio-net device is not present in WASI
-  0.3 images (its PCI slot is used by the bridge device). Networking is
-  expected to be provided through WASI 0.3 sockets or a custom bridged
-  interface in the future.
+- Networking covers outgoing TCP and DNS only (see [Networking](#networking)):
+  no UDP besides DNS, no inbound connections, no IPv6, no ICMP beyond the
+  gateway.
 - Interactive stdin is unreliable: wasi-libc's non-blocking reads of stdin
   block on WASI 0.3 and report end of file while the host keeps stdin open.
   Hosts driving the container through exported interfaces should not give
@@ -128,10 +166,11 @@ Rules and limitations of the bridge:
 - Host directories (`wasmtime run --dir host::guest`, or a preopen given by
   the host program) are mounted in the container at the guest path as with
   the preview 1 images; files and directories can be created, listed,
-  renamed and removed through them. Permission bits are not reported by
-  WASI, so entries show up with mode 0 (the container runs as root and is
-  not affected). File locks are always granted: WASI has none, and the
-  container is the only user of the device.
+  renamed and removed through them. WASI has no ownership or permission
+  bits: entries are reported readable and executable by everyone (so that
+  programs installed there run), and `chmod`/`chown` succeed without
+  effect. File locks are always granted: WASI has none, and the container
+  is the only user of the device.
 
 ## Debugging
 
@@ -160,14 +199,16 @@ Rules and limitations of the bridge:
  ┌──────────────────────────── out.wasm (component) ─────────────┴──┐
  │  bridge component (Rust, generated)                                │
  │   - exports wasi:cli/run and the custom exports                    │
- │   - imports the custom imports and c2w:bridge/vm                   │
- │       │ c2w:bridge/vm: run / next-request / complete / invoke      │
+ │   - imports the custom imports, wasi:sockets and c2w:bridge/vm     │
+ │   - TCP/IP stack (smoltcp) behind the guest's network interface    │
+ │       │ c2w:bridge/vm: run / next-request / complete / invoke /    │
+ │       │                net-recv / net-send                         │
  │       ▼                                                            │
  │  emulator core module (Bochs, wasm32-wasip3)                       │
  │   - `run`: stackless async export driven by Asyncify unwind/rewind │
- │   - virtio-console port carrying the frame protocol                │
- │       │ /dev/hvc1                                                  │
- │       ▼                                                            │
+ │   - virtio-console port carrying the frame protocol, virtio-net    │
+ │       │ /dev/hvc1                    │ eth0 (ethernet frames)      │
+ │       ▼                              ▼                             │
  │  Linux guest: init bridge daemon ─ /run/c2w/bridge.sock ─ container│
  └────────────────────────────────────────────────────────────────────┘
 ```
@@ -183,7 +224,11 @@ The build (`Dockerfile`, stages `p3-*` and `bochs-dev-p3`) has three parts:
    turned into a component. Its `wasi:cli/run` spawns a pump that fetches
    requests from the emulator (`next-request`), performs the host calls
    concurrently and completes them (`complete`), while awaiting the emulator's
-   `run`.
+   `run`. `wasi:cli/run` also starts the network stack (`netstack.rs`): a
+   task receives the guest's ethernet frames (`net-recv`), a driver polls
+   smoltcp and queues the frames for the guest (`net-send`), and each TCP
+   connection accepted from the guest gets two tasks copying data from and
+   to a `wasi:sockets` TCP socket of the host.
 
 2. **Emulator core module** (`extras/wasip3/vmcore`, `extras/wasip3/bochs`).
    Bochs is compiled with wasi-sdk 34 for `wasm32-wasip3` (reactor model) and

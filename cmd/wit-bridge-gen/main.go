@@ -5,7 +5,7 @@
 // Output files (in --out):
 //
 //	generated.rs     Rust code included by the bridge crate
-//	world.wit        the composed world (user world + c2w:bridge/vm + wasi:cli/run)
+//	world.wit        the composed world (user world + c2w:bridge/vm + wasi imports + wasi:cli/run)
 //	description.json the resolve JSON, served to guest SDKs by the emulator
 package main
 
@@ -105,6 +105,10 @@ package c2w:bridge-composed;
 world bridge {
     include %s;
     import c2w:bridge/vm@0.1.0;
+    // Used by the network stack serving the container's virtio-net device.
+    import wasi:sockets/types@0.3.0;
+    import wasi:sockets/ip-name-lookup@0.3.0;
+    import wasi:clocks/monotonic-clock@0.3.0;
     export wasi:cli/run@0.3.0;
 }
 `, include)

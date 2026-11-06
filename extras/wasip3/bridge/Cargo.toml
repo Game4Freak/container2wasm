@@ -15,7 +15,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = { version = "0.63.0", features = ["async-spawn"] }
+wit-bindgen = { version = "0.63.0", features = ["async-spawn", "inter-task-wakeup"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc", "float_roundtrip"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 

@@ -1110,7 +1110,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # container image or the WIT package, so it is cached across conversions.
 FROM p3-toolchain AS bochs-dev-p3-compile
 COPY --link --from=bochs-repo / /Bochs
-COPY --link --from=assets extras/wasip3 /work/extras/wasip3
+# Only the emulator side of extras/wasip3: changes to the bridge component
+# or the SDKs must not trigger a recompilation of Bochs.
+COPY --link --from=assets extras/wasip3/bochs /work/extras/wasip3/bochs
+COPY --link --from=assets extras/wasip3/vmcore /work/extras/wasip3/vmcore
+COPY --link --from=assets extras/wasip3/scripts /work/extras/wasip3/scripts
+COPY --link --from=assets extras/wasip3/wit /work/extras/wasip3/wit
 RUN cd /Bochs && patch -p1 < /work/extras/wasip3/bochs/bochs-wasip3.patch
 ARG INIT_DEBUG
 RUN BOCHS_SRC=/Bochs OUT=/bochs-out C2W_SRC=/work INIT_DEBUG=${INIT_DEBUG} \

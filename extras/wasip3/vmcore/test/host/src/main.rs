@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
         Ok((Point { x: p.y, y: p.x },))
     })?;
 
-    let ctx = WasiCtxBuilder::new().inherit_stdio().inherit_env().build();
+    let ctx = WasiCtxBuilder::new().inherit_stdio().inherit_env().inherit_network().allow_tcp(true).allow_udp(true).allow_ip_name_lookup(true).build();
     let mut store = Store::new(&engine, State { ctx, table: ResourceTable::new() });
     let instance = linker.instantiate_async(&mut store, &component).await?;
 

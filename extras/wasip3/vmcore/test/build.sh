@@ -36,15 +36,15 @@ fi
 
 # 1. Bridge component for the test world.
 BRIDGE="$OUT/bridge"
-rm -rf "$BRIDGE" && mkdir -p "$BRIDGE/wit/deps/app" "$BRIDGE/wit/deps/c2w-bridge" "$BRIDGE/wit/deps/wasi-cli-run" "$BRIDGE/src"
+rm -rf "$BRIDGE" && mkdir -p "$BRIDGE/wit/deps/app" "$BRIDGE/wit/deps/c2w-bridge" "$BRIDGE/src"
 wasm-tools component wit --json wit > "$OUT/resolve.json"
 "$WIT_BRIDGE_GEN" --resolve "$OUT/resolve.json" --out "$OUT/gen"
 cp wit/*.wit "$BRIDGE/wit/deps/app/"
 cp "$ROOT/extras/wasip3/wit/c2w-bridge/"*.wit "$BRIDGE/wit/deps/c2w-bridge/"
-cp "$ROOT/extras/wasip3/bridge/wit/deps/wasi-cli-run/"*.wit "$BRIDGE/wit/deps/wasi-cli-run/"
+cp -r "$ROOT/extras/wasip3/bridge/wit/deps/." "$BRIDGE/wit/deps/"
 cp "$OUT/gen/world.wit" "$BRIDGE/wit/"
-cp "$ROOT/extras/wasip3/bridge/Cargo.toml" "$ROOT/extras/wasip3/bridge/src/lib.rs" "$BRIDGE/" 2>/dev/null || true
-cp "$ROOT/extras/wasip3/bridge/src/lib.rs" "$BRIDGE/src/"
+cp "$ROOT/extras/wasip3/bridge/Cargo.toml" "$BRIDGE/"
+cp "$ROOT/extras/wasip3/bridge/src/"*.rs "$BRIDGE/src/"
 [ -f "$ROOT/extras/wasip3/bridge/Cargo.lock" ] && cp "$ROOT/extras/wasip3/bridge/Cargo.lock" "$BRIDGE/"
 cp "$OUT/gen/generated.rs" "$BRIDGE/src/"
 (cd "$BRIDGE" && cargo build --release --target wasm32-unknown-unknown)

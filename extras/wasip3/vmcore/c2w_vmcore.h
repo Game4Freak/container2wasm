@@ -41,6 +41,17 @@ size_t c2w_bridge_tx_pull(uint8_t *buf, size_t len);
 /* True when c2w_bridge_tx_pull would return data. */
 bool c2w_bridge_tx_pending(void);
 
+/* An ethernet frame sent by the guest on its network interface. */
+void c2w_net_rx(const uint8_t *frame, size_t len);
+
+/* Copy the next frame destined to the guest into `buf` (capacity `cap`)
+ * and return its length, 0 if nothing is pending. Frames larger than `cap`
+ * are dropped. */
+size_t c2w_net_tx_pull(uint8_t *buf, size_t cap);
+
+/* True when c2w_net_tx_pull would return a frame. */
+bool c2w_net_tx_pending(void);
+
 /* True when a verbose log of bridge activity should be printed to stderr
  * (controlled by the C2W_BRIDGE_DEBUG environment variable). */
 bool c2w_bridge_debug(void);

@@ -46,5 +46,18 @@ func TestWasmtimeP3(t *testing.T) {
 				"/run/c2w/c2w-call wasi:clocks/system-clock@0.3.0 now | grep -o seconds && /run/c2w/c2w-call --describe | head -c 1"),
 			Want: utils.WantString("seconds\n{"),
 		},
+		{
+			// Networking: the stack of the bridge component resolves names
+			// and proxies TCP connections through wasi:sockets of the host.
+			Name:    "wasmtime-p3-net",
+			Runtime: "wasmtime-p3",
+			Inputs: []utils.Input{
+				{Image: "alpine:3.17", ConvertOpts: []string{"--target=wasi-p3"}, Architecture: utils.X8664},
+			},
+			RuntimeOpts: utils.StringFlags("run", "-Sp3", "-Sinherit-network", "-Sallow-ip-name-lookup"),
+			Args: utils.StringFlags("/bin/sh", "-c",
+				"wget -q -O - http://example.com/ | grep -o -m1 'Example Domain'"),
+			Want: utils.WantString("Example Domain\n"),
+		},
 	}...)
 }

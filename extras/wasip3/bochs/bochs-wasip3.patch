@@ -1,24 +1,39 @@
+diff --git a/bochs/bochs.h b/bochs/bochs.h
+index 3c02fc3be..8d6766279 100644
+--- a/bochs/bochs.h
++++ b/bochs/bochs.h
+@@ -357,7 +357,13 @@ extern bool bx_gui_sighandler;
+ #define BX_N_OPTRAM_IMAGES 4
+ #define BX_N_SERIAL_PORTS 4
+ #define BX_N_PARALLEL_PORTS 2
++#ifdef WASIP3
++// container2wasm WASI 0.3 images need room for the two virtio-9p devices,
++// two virtio-consoles, virtio-net and the EHCI controller.
++#define BX_N_PCI_SLOTS 8
++#else
+ #define BX_N_PCI_SLOTS 5
++#endif
+ 
+ void bx_center_print(FILE *file, const char *line, unsigned maxwidth);
+ 
 diff --git a/bochs/iodev/devices.cc b/bochs/iodev/devices.cc
-index 3447ec3e3..049ec5fe9 100644
+index 3447ec3e3..c80a31b75 100644
 --- a/bochs/iodev/devices.cc
 +++ b/bochs/iodev/devices.cc
-@@ -363,7 +363,14 @@ void bx_devices_c::init(BX_MEM_C *newmem)
-   PLUG_load_plugin(mapdirVirtio9p, PLUGTYPE_STANDARD);
+@@ -364,6 +364,11 @@ void bx_devices_c::init(BX_MEM_C *newmem)
    PLUG_load_plugin(packVirtio9p, PLUGTYPE_STANDARD);
    PLUG_load_plugin(stdioVirtioConsole, PLUGTYPE_STANDARD);
-+#ifdef WASIP3
-+  // Networking is not available on WASI 0.3 yet: the bridge console takes
-+  // the PCI slot of virtio-net (i440FX has 5 slots and one must stay free
-+  // for the EHCI controller carrying the rootfs).
-+  PLUG_load_plugin(bridgeVirtioConsole, PLUGTYPE_STANDARD);
-+#else
    PLUG_load_plugin(socketVirtioNet, PLUGTYPE_STANDARD);
++#ifdef WASIP3
++  // The bridge console (/dev/hvc1) must come after the stdio console
++  // (/dev/hvc0): the guest numbers the ports in PCI order.
++  PLUG_load_plugin(bridgeVirtioConsole, PLUGTYPE_STANDARD);
 +#endif
  #endif
    bx_init_plugins();
  
 diff --git a/bochs/main.cc b/bochs/main.cc
-index 1b269fa0a..2a681d5e9 100644
+index 1b269fa0a..14cc621aa 100644
 --- a/bochs/main.cc
 +++ b/bochs/main.cc
 @@ -39,7 +39,9 @@
@@ -31,18 +46,23 @@ index 1b269fa0a..2a681d5e9 100644
  #include <wasi/libc-environ.h>
  extern "C" {
  #include "jmp.h"
-@@ -593,6 +595,10 @@ int init_vm(int argc, char **argv, FSVirtFile *info)
+@@ -592,6 +594,15 @@ int init_vm(int argc, char **argv, FSVirtFile *info)
+     }
  #endif
  
-     if (net != NULL) {
 +#ifdef WASIP3
-+      fprintf(stderr, "networking is not supported on WASI 0.3 images yet\n");
-+      exit(1);
++    // WASI 0.3 images always have a network: the bridge component provides
++    // the stack behind virtio-net, and the host decides what it may reach
++    // through its wasi:sockets policy.
++    if (net == NULL)
++      net = (char *)"bridge";
++    if (mac == NULL)
++      mac = (char *)"";
 +#endif
+     if (net != NULL) {
        if (!strncmp(net, "socket", 6)) {
          if (start_socket_net(net) != 0) {
-           fprintf(stderr, "failed to wait socket net");
-@@ -625,6 +631,18 @@ int init_vm(int argc, char **argv, FSVirtFile *info)
+@@ -625,6 +636,18 @@ int init_vm(int argc, char **argv, FSVirtFile *info)
      }
      pos += ps;
  
@@ -61,7 +81,7 @@ index 1b269fa0a..2a681d5e9 100644
      info->len = pos;
  #ifdef WASI
      info->len += write_preopen_info(info, pos);
-@@ -866,7 +884,21 @@ int WINAPI WinMain(
+@@ -866,7 +889,21 @@ int WINAPI WinMain(
  #endif
  
  #if !defined(__WXMSW__)
@@ -84,7 +104,7 @@ index 1b269fa0a..2a681d5e9 100644
  extern "C" {
  extern void __wasi_vfs_rt_init(void);
  }
-@@ -913,7 +945,9 @@ int CDECL main(int argc, char *argv[])
+@@ -913,7 +950,9 @@ int CDECL main(int argc, char *argv[])
  {
  #ifdef WASI
    __wasilibc_ensure_environ();
@@ -129,7 +149,7 @@ index eecb8ecb5..493389bd6 100644
  
  #ifdef __cplusplus
 diff --git a/bochs/wasm.cc b/bochs/wasm.cc
-index 602f4b907..cd85ba870 100644
+index 602f4b907..7f2949c9a 100644
 --- a/bochs/wasm.cc
 +++ b/bochs/wasm.cc
 @@ -166,7 +166,15 @@ static int console_read_stdin(void *opaque, uint8_t *buf, int len)
@@ -273,7 +293,19 @@ index 602f4b907..cd85ba870 100644
  
  int is_preopened(const char *path1) {
    for (int j = 0; j < num_preopens; j++) {
-@@ -773,13 +812,17 @@ static int fs_mkdir(FSDevice *fs, FSQID *qid, FSFile *f,
+@@ -590,6 +629,11 @@ static int p9_flags_to_host(int flags)
+ static mode_t host_mode_to_p9(mode_t m) {
+     mode_t ret = 0;
+     ret = m & 0700;
++#ifdef WASI
++    // WASI has no permission bits: everything is readable and executable
++    // (programs installed into a shared directory must be runnable).
++    ret |= 0555;
++#endif
+     if (S_ISBLK(m)) {
+       ret |= P9_S_IFDIR;
+     } else if (S_ISCHR(m)) {
+@@ -773,13 +817,17 @@ static int fs_mkdir(FSDevice *fs, FSQID *qid, FSFile *f,
  static int fs_open(FSDevice *fs, FSQID *qid, FSFile *f, uint32_t flags, void *opaque)
  {
      struct stat st;
@@ -293,7 +325,49 @@ index 602f4b907..cd85ba870 100644
          DIR *dirp;
          dirp = opendir(f->path);
          if (!dirp)
-@@ -1179,7 +1222,12 @@ static int fs_unlinkat(FSDevice *fs, FSFile *f, const char *name)
+@@ -1026,18 +1074,27 @@ static int fs_setattr(FSDevice *fs, FSFile *f, uint32_t mask,
+     bool ctime_updated = false;
+ 
+     if (mask & (P9_SETATTR_UID | P9_SETATTR_GID)) {
+-        return P9_ENOTSUP; // TODO
++#ifdef WASI
++        // WASI has no ownership: accept and ignore (like a filesystem
++        // without permission support), so that chown succeeds.
++#else
++        return -P9_ENOTSUP; // TODO
+ //        if (lchown(f->path, (mask & P9_SETATTR_UID) ? uid : -1,
+ //                   (mask & P9_SETATTR_GID) ? gid : -1) < 0)
+ //            return -errno_to_p9(errno);
+ //        ctime_updated = true;
++#endif
+     }
+     /* must be done after uid change for suid */
+     if (mask & P9_SETATTR_MODE) {
+-        return P9_ENOTSUP; // TODO
++#ifdef WASI
++        // No permission bits on WASI: chmod succeeds without effect.
++#else
++        return -P9_ENOTSUP; // TODO
+ //        if (chmod(f->path, mode) < 0)
+ //            return -errno_to_p9(errno);
+ //        ctime_updated = true;
++#endif
+     }
+     if (mask & P9_SETATTR_SIZE) {
+         if (truncate(f->path, size) < 0)
+@@ -1075,7 +1132,10 @@ static int fs_setattr(FSDevice *fs, FSFile *f, uint32_t mask,
+         ctime_updated = true;
+     }
+     if ((mask & P9_SETATTR_CTIME) && !ctime_updated) {
+-        return P9_ENOTSUP; // TODO
++#ifdef WASI
++        return 0;
++#endif
++        return -P9_ENOTSUP; // TODO
+ //        if (lchown(f->path, -1, -1) < 0)
+ //            return -errno_to_p9(errno);
+     }
+@@ -1179,7 +1239,12 @@ static int fs_unlinkat(FSDevice *fs, FSFile *f, const char *name)
  
  static int fs_lock(FSDevice *fs, FSFile *f, const FSLock *lock)
  {
@@ -307,7 +381,7 @@ index 602f4b907..cd85ba870 100644
  //    int ret;
  //    struct flock fl;
  //    
-@@ -1205,7 +1253,11 @@ static int fs_lock(FSDevice *fs, FSFile *f, const FSLock *lock)
+@@ -1205,7 +1270,11 @@ static int fs_lock(FSDevice *fs, FSFile *f, const FSLock *lock)
  
  static int fs_getlock(FSDevice *fs, FSFile *f, FSLock *lock)
  {
@@ -320,6 +394,35 @@ index 602f4b907..cd85ba870 100644
  //    int ret;
  //    struct flock fl;
  //    
+@@ -3056,6 +3125,7 @@ int bx_virtio_net_ctrl_c::device_recv(int queue_idx, int desc_idx, int read_size
+     return 0;
+ }
+ 
++#ifndef WASIP3 /* host socket backend (preview 1 / emscripten) */
+ typedef struct {
+     int fd;
+     bool select_filled;
+@@ -3329,4 +3399,20 @@ int start_socket_net(char *flag)
+   }
+   return 0;
+ }
++#else /* WASIP3 */
++// Frames are exchanged with the network stack of the bridge component
++// (extras/wasip3/bochs/wasm_bridge.cc).
++EthernetDevice *c2w_net_device_init(void);
++
++static EthernetDevice *socket_net_init()
++{
++  return c2w_net_device_init();
++}
++
++int start_socket_net(char *flag)
++{
++  return 0;
++}
++#endif /* WASIP3 */
++
+ #endif /* BX_SUPPORT_PCI */
 diff --git a/bochs/wasm.h b/bochs/wasm.h
 index 1952f42da..5f3da07d8 100644
 --- a/bochs/wasm.h

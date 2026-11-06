@@ -5,7 +5,9 @@ package c2w:bridge@0.1.0;
 /// Exported by the emulator core module, imported by the bridge component.
 ///
 /// All string payloads are JSON documents described in
-/// docs/wasip3-bridge-protocol.md.
+/// docs/wasip3-bridge-protocol.md. The `net-*` functions carry the raw
+/// ethernet frames of the guest's virtio-net device; the bridge component
+/// implements the network stack behind them (see docs/wasip3.md).
 interface vm {
     /// Boot the guest and run it until it powers off.
     ///
@@ -27,9 +29,22 @@ interface vm {
     /// Resolves once the guest program has produced the response.
     invoke: async func(request: string) -> string;
 
+    /// Wait for ethernet frames sent by the guest on its network interface.
+    /// The returned bytes hold one or more frames, each prefixed with its
+    /// length as a 16-bit little-endian integer.
+    net-recv: async func() -> list<u8>;
+
+    /// Queue ethernet frames for the guest's network interface, in the same
+    /// encoding as the result of `net-recv`. Never blocks.
+    net-send: func(frames: list<u8>);
+
+    /// Print a line on the emulator's stderr when bridge debugging is
+    /// enabled (C2W_BRIDGE_DEBUG in the environment of the component).
+    log: func(message: string);
+
     /// Never called. It exists so that the canonical ABI helpers for
     /// `future<u8>` are available to the emulator, which uses futures to
-    /// wake the tasks waiting in `next-request` and `invoke`.
+    /// wake the tasks waiting in `next-request`, `invoke` and `net-recv`.
     wake-future: func() -> future<u8>;
 }
 
